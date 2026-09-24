@@ -3,17 +3,17 @@ workflows:
     name: iOS IPA (Expo)
     max_build_duration: 120
     instance_type: mac_mini_m2
-    integrations:
-      # 在 Codemagic 网页里添加 App Store Connect API Key 后，把下面改成你的密钥名称
-      # app_store_connect: My App Store Connect Key
+    # 有 Apple 开发者账号后，取消下面两段注释，并填入真实密钥名：
+    # integrations:
+    #   app_store_connect: My App Store Connect Key
     environment:
       node: 22.11.0
       xcode: latest
       cocoapods: default
-      ios_signing:
-        # 有 Apple 开发者账号后再打开签名：
-        # distribution_type: ad_hoc   # 或 app_store / development
-        # bundle_identifier: com.local.iphonehello
+      # 有开发者账号后取消注释：
+      # ios_signing:
+      #   distribution_type: ad_hoc
+      #   bundle_identifier: com.local.iphonehello
       vars:
         XCODE_WORKSPACE: "IphoneHello.xcworkspace"
         XCODE_SCHEME: "IphoneHello"
@@ -36,7 +36,8 @@ workflows:
           /usr/libexec/PlistBuddy -c "Add :CFBundleDisplayName string 你好我需要这个" "$PLIST" || true
       - name: Build IPA
         script: |
-          xcode-project use-profiles
+          # 配置好 ios_signing 后保留下一行；未配置签名时先注释掉 use-profiles
+          # xcode-project use-profiles
           xcode-project build-ipa \
             --workspace "$CM_BUILD_DIR/ios/$XCODE_WORKSPACE" \
             --scheme "$XCODE_SCHEME"
