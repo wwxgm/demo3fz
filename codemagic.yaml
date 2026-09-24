@@ -1,0 +1,46 @@
+workflows:
+  ios-ipa:
+    name: iOS IPA (Expo)
+    max_build_duration: 120
+    instance_type: mac_mini_m2
+    integrations:
+      # 在 Codemagic 网页里添加 App Store Connect API Key 后，把下面改成你的密钥名称
+      # app_store_connect: My App Store Connect Key
+    environment:
+      node: 22.11.0
+      xcode: latest
+      cocoapods: default
+      ios_signing:
+        # 有 Apple 开发者账号后再打开签名：
+        # distribution_type: ad_hoc   # 或 app_store / development
+        # bundle_identifier: com.local.iphonehello
+      vars:
+        XCODE_WORKSPACE: "IphoneHello.xcworkspace"
+        XCODE_SCHEME: "IphoneHello"
+        APP_ID: com.local.iphonehello
+    scripts:
+      - name: Install npm dependencies
+        script: |
+          npm ci || npm install
+      - name: Expo prebuild (generate ios/)
+        script: |
+          npx expo prebuild --platform ios --non-interactive
+      - name: Install CocoaPods
+        script: |
+          cd ios && pod install
+      - name: Set Info.plist
+        script: |
+          PLIST="$CM_BUILD_DIR/ios/$XCODE_SCHEME/Info.plist"
+          /usr/libexec/PlistBuddy -c "Add :ITSAppUsesNonExemptEncryption bool false" "$PLIST" || true
+          /usr/libexec/PlistBuddy -c "Set :CFBundleDisplayName 你好我需要这个" "$PLIST" || \
+          /usr/libexec/PlistBuddy -c "Add :CFBundleDisplayName string 你好我需要这个" "$PLIST" || true
+      - name: Build IPA
+        script: |
+          xcode-project use-profiles
+          xcode-project build-ipa \
+            --workspace "$CM_BUILD_DIR/ios/$XCODE_WORKSPACE" \
+            --scheme "$XCODE_SCHEME"
+    artifacts:
+      - build/ios/ipa/*.ipa
+      - /tmp/xcodebuild_logs/*.log
+      - $HOME/Library/Developer/Xcode/DerivedData/**/Build/**/*.dSYM
