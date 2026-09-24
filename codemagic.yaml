@@ -1,23 +1,15 @@
 workflows:
   ios-ipa:
-    name: iOS IPA (Expo)
+    name: iOS unsigned IPA (Expo) — 同 demo1 免费无签名方式
     max_build_duration: 120
     instance_type: mac_mini_m2
-    # 有 Apple 开发者账号后，取消下面两段注释，并填入真实密钥名：
-    # integrations:
-    #   app_store_connect: My App Store Connect Key
     environment:
       node: 22.11.0
       xcode: latest
       cocoapods: default
-      # 有开发者账号后取消注释：
-      # ios_signing:
-      #   distribution_type: ad_hoc
-      #   bundle_identifier: com.local.iphonehello
       vars:
         XCODE_WORKSPACE: "IphoneHello.xcworkspace"
         XCODE_SCHEME: "IphoneHello"
-        APP_ID: com.local.iphonehello
     scripts:
       - name: Install npm dependencies
         script: |
@@ -34,14 +26,31 @@ workflows:
           /usr/libexec/PlistBuddy -c "Add :ITSAppUsesNonExemptEncryption bool false" "$PLIST" || true
           /usr/libexec/PlistBuddy -c "Set :CFBundleDisplayName 你好我需要这个" "$PLIST" || \
           /usr/libexec/PlistBuddy -c "Add :CFBundleDisplayName string 你好我需要这个" "$PLIST" || true
-      - name: Build IPA
+      - name: Build unsigned iOS app
         script: |
-          # 配置好 ios_signing 后保留下一行；未配置签名时先注释掉 use-profiles
-          # xcode-project use-profiles
-          xcode-project build-ipa \
-            --workspace "$CM_BUILD_DIR/ios/$XCODE_WORKSPACE" \
-            --scheme "$XCODE_SCHEME"
+          xcodebuild \
+            -workspace "$CM_BUILD_DIR/ios/$XCODE_WORKSPACE" \
+            -scheme "$XCODE_SCHEME" \
+            -configuration Release \
+            -sdk iphoneos \
+            -derivedDataPath "$CM_BUILD_DIR/build/derived" \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            build
+      - name: Package unsigned IPA
+        script: |
+          APP=$(find "$CM_BUILD_DIR/build/derived" -name "*.app" -type d | head -n 1)
+          echo "Found app: $APP"
+          test -n "$APP"
+          OUT="$CM_BUILD_DIR/build/ios"
+          mkdir -p "$OUT/Payload"
+          rm -rf "$OUT/Payload/"* "$OUT/unsigned-iphone-hello.ipa"
+          cp -R "$APP" "$OUT/Payload/"
+          cd "$OUT"
+          zip -qry unsigned-iphone-hello.ipa Payload
+          ls -lh unsigned-iphone-hello.ipa
     artifacts:
-      - build/ios/ipa/*.ipa
+      - build/ios/unsigned-iphone-hello.ipa
+      - build/derived/**/*.app
       - /tmp/xcodebuild_logs/*.log
-      - $HOME/Library/Developer/Xcode/DerivedData/**/Build/**/*.dSYM
