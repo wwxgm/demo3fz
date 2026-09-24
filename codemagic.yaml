@@ -13,7 +13,6 @@ workflows:
     scripts:
       - name: Install npm dependencies
         script: |
-          # CI 上必须装全依赖（含 babel），否则 Bundle RN 阶段会失败
           export NODE_ENV=development
           npm ci || npm install
           node -e "require('babel-preset-expo'); console.log('babel-preset-expo OK')"
@@ -29,17 +28,6 @@ workflows:
           /usr/libexec/PlistBuddy -c "Add :ITSAppUsesNonExemptEncryption bool false" "$PLIST" || true
           /usr/libexec/PlistBuddy -c "Set :CFBundleDisplayName 你好我需要这个" "$PLIST" || \
           /usr/libexec/PlistBuddy -c "Add :CFBundleDisplayName string 你好我需要这个" "$PLIST" || true
-      - name: Pre-bundle JavaScript
-        script: |
-          # 先在本机打好 JS 包，降低 Xcode Bundle 脚本对 Babel 的偶发失败
-          export NODE_ENV=production
-          npx expo export:embed --platform ios || npx react-native bundle \
-            --entry-file index.js \
-            --platform ios \
-            --dev false \
-            --reset-cache \
-            --bundle-output ios/main.jsbundle \
-            --assets-dest ios
       - name: Build unsigned iOS app
         script: |
           export NODE_ENV=production
