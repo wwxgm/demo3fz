@@ -26,8 +26,8 @@ workflows:
         script: |
           PLIST="$CM_BUILD_DIR/ios/$XCODE_SCHEME/Info.plist"
           /usr/libexec/PlistBuddy -c "Add :ITSAppUsesNonExemptEncryption bool false" "$PLIST" || true
-          /usr/libexec/PlistBuddy -c "Set :CFBundleDisplayName 你好我需要这个" "$PLIST" || \
-          /usr/libexec/PlistBuddy -c "Add :CFBundleDisplayName string 你好我需要这个" "$PLIST" || true
+          /usr/libexec/PlistBuddy -c "Set :CFBundleDisplayName 视频翻转" "$PLIST" || \
+          /usr/libexec/PlistBuddy -c "Add :CFBundleDisplayName string 视频翻转" "$PLIST" || true
       - name: Build unsigned iOS app
         script: |
           export NODE_ENV=production

@@ -1,6 +1,6 @@
 {
   "name": "iphone-hello",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "main": "index.js",
   "scripts": {
     "start": "expo start",
@@ -14,9 +14,14 @@
     "@babel/core": "^7.25.2",
     "babel-preset-expo": "~54.0.0",
     "expo": "~54.0.0",
+    "expo-document-picker": "~14.0.8",
+    "expo-image-picker": "~17.0.11",
+    "expo-media-library": "~18.2.1",
     "expo-status-bar": "~3.0.8",
     "react": "19.1.0",
-    "react-native": "0.81.5"
+    "react-native": "0.81.5",
+    "react-native-safe-area-context": "~5.6.0",
+    "video-flip": "file:./modules/video-flip"
   },
   "devDependencies": {
     "@expo/ngrok": "^4.1.3",

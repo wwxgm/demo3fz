@@ -1,0 +1,13 @@
+{
+  "name": "video-flip",
+  "version": "1.0.0",
+  "description": "Horizontally mirror a video with AVFoundation",
+  "main": "index.ts",
+  "types": "index.ts",
+  "peerDependencies": {
+    "expo": "*",
+    "react": "*",
+    "react-native": "*"
+  },
+  "license": "MIT"
+}
