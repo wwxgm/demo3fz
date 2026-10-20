@@ -80,7 +80,7 @@ private enum VideoFlipper {
     let extend = Self.parseExtend(options)
     let timeline: ClipTimeline.Result
     if let extend {
-      timeline = try ClipTimeline.build(
+      timeline = try await ClipTimeline.build(
         video: videoTrack,
         audio: sourceAudio,
         sourceStart: sourceRange.start,
@@ -88,7 +88,7 @@ private enum VideoFlipper {
         extend: extend
       )
     } else {
-      timeline = try Self.plainTimeline(video: videoTrack, audio: sourceAudio, sourceRange: sourceRange)
+      timeline = try await Self.plainTimeline(video: videoTrack, audio: sourceAudio, sourceRange: sourceRange)
     }
     let composition = timeline.composition
     let compositionVideoTrack = timeline.videoTrack
@@ -258,7 +258,7 @@ private enum VideoFlipper {
     video: AVAssetTrack,
     audio: AVAssetTrack?,
     sourceRange: CMTimeRange
-  ) throws -> ClipTimeline.Result {
+  ) async throws -> ClipTimeline.Result {
     let composition = AVMutableComposition()
     guard let compositionVideoTrack = composition.addMutableTrack(
       withMediaType: .video,
@@ -274,7 +274,7 @@ private enum VideoFlipper {
         withMediaType: .audio,
         preferredTrackID: kCMPersistentTrackID_Invalid
        ) {
-      let audioRange = audio.timeRange
+      let audioRange = try await audio.load(.timeRange)
       let audioDuration = CMTimeMinimum(sourceRange.duration, audioRange.duration)
       if audioDuration.isValid, audioDuration.seconds > 0 {
         let range = CMTimeRange(start: audioRange.start, duration: audioDuration)

@@ -33,8 +33,14 @@ enum ClipTimeline {
     sourceStart: CMTime,
     sourceDuration: CMTime,
     extend: ClipExtend
-  ) throws -> Result {
+  ) async throws -> Result {
     let duration = sourceDuration.seconds
+    let audioSpan: CMTimeRange?
+    if let audio {
+      audioSpan = try await audio.load(.timeRange)
+    } else {
+      audioSpan = nil
+    }
     guard extend.end > extend.start + 0.2 else {
       throw ClipTimelineError.message("片段结束时间要晚于开始时间")
     }
@@ -56,10 +62,13 @@ enum ClipTimeline {
       throw ClipTimelineError.message("无法拼接视频")
     }
     compositionVideo.preferredTransform = .identity
-    let compositionAudio = audio == nil ? nil : composition.addMutableTrack(
-      withMediaType: .audio,
-      preferredTrackID: kCMPersistentTrackID_Invalid
-    )
+    var compositionAudio: AVMutableCompositionTrack?
+    if audio != nil {
+      compositionAudio = composition.addMutableTrack(
+        withMediaType: .audio,
+        preferredTrackID: kCMPersistentTrackID_Invalid
+      )
+    }
 
     let insertAt = min(extend.end, duration)
     var cursor = CMTime.zero
@@ -70,6 +79,7 @@ enum ClipTimeline {
         audio: audio,
         compositionVideo: compositionVideo,
         compositionAudio: compositionAudio,
+        audioSpan: audioSpan,
         sourceStart: sourceTime(0, base: sourceStart),
         length: seconds(insertAt),
         at: cursor,
@@ -109,6 +119,7 @@ enum ClipTimeline {
         insertAudio(
           audio,
           compositionAudio: compositionAudio,
+          audioSpan: audioSpan,
           sourceStart: sourceTime(extend.start, base: sourceStart),
           length: replayLength,
           at: replayAt
@@ -124,6 +135,7 @@ enum ClipTimeline {
         audio: audio,
         compositionVideo: compositionVideo,
         compositionAudio: compositionAudio,
+        audioSpan: audioSpan,
         sourceStart: sourceTime(insertAt, base: sourceStart),
         length: seconds(rest),
         at: cursor,
@@ -145,6 +157,7 @@ enum ClipTimeline {
     audio: AVAssetTrack?,
     compositionVideo: AVMutableCompositionTrack,
     compositionAudio: AVMutableCompositionTrack?,
+    audioSpan: CMTimeRange?,
     sourceStart: CMTime,
     length: CMTime,
     at cursor: CMTime,
@@ -152,7 +165,14 @@ enum ClipTimeline {
   ) throws -> CMTime {
     try compositionVideo.insertTimeRange(CMTimeRange(start: sourceStart, duration: length), of: video, at: cursor)
     if includeAudio, let audio, let compositionAudio {
-      insertAudio(audio, compositionAudio: compositionAudio, sourceStart: sourceStart, length: length, at: cursor)
+      insertAudio(
+        audio,
+        compositionAudio: compositionAudio,
+        audioSpan: audioSpan,
+        sourceStart: sourceStart,
+        length: length,
+        at: cursor
+      )
     }
     return CMTimeAdd(cursor, length)
   }
@@ -160,12 +180,15 @@ enum ClipTimeline {
   private static func insertAudio(
     _ audio: AVAssetTrack,
     compositionAudio: AVMutableCompositionTrack,
+    audioSpan: CMTimeRange?,
     sourceStart: CMTime,
     length: CMTime,
     at cursor: CMTime
   ) {
+    guard let available = audioSpan else {
+      return
+    }
     let requested = CMTimeRange(start: sourceStart, duration: length)
-    let available = audio.timeRange
     let piece = requested.intersection(available)
     guard piece.duration.isValid, piece.duration.seconds > 0.02 else {
       return
