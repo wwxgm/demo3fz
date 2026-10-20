@@ -313,20 +313,7 @@ private enum VideoFlipper {
       let audioRange = try await audioTrack.load(.timeRange)
       try? compositionAudio.insertTimeRange(audioRange, of: audioTrack, at: .zero)
     }
-    let naturalSize = try await videoTrack.load(.naturalSize)
-    let preferred = try await videoTrack.load(.preferredTransform)
-    let fitted = CGRect(origin: .zero, size: naturalSize).applying(preferred)
-    let renderSize = CGSize(width: abs(fitted.width), height: abs(fitted.height))
-    let instruction = AVMutableVideoCompositionInstruction()
-    instruction.timeRange = CMTimeRange(start: .zero, duration: range.duration)
-    let layerInstruction = AVMutableVideoCompositionLayerInstruction(assetTrack: compositionVideo)
-    layerInstruction.setTransform(preferred, at: .zero)
-    instruction.layerInstructions = [layerInstruction]
-    let videoComposition = AVMutableVideoComposition()
-    videoComposition.instructions = [instruction]
-    videoComposition.renderSize = renderSize
-    videoComposition.frameDuration = CMTime(value: 1, timescale: 30)
-    LookFilter.install(videoComposition, name: name)
+    let videoComposition = LookFilter.composition(asset: composition, name: name)
     try await exportVideo(
       asset: asset,
       composition: composition,
@@ -397,7 +384,7 @@ private enum VideoFlipper {
   private static func exportVideo(
     asset: AVAsset,
     composition: AVMutableComposition,
-    videoComposition: AVMutableVideoComposition,
+    videoComposition: AVVideoComposition,
     audioMix: AVMutableAudioMix?,
     outputURL: URL
   ) async throws {

@@ -68,7 +68,7 @@ private final class NarrationKeeper {
 
 private final class NarrationWriter: NSObject {
   let output: URL
-  private var continuation: CheckedContinuation<(URL, Double), Error>?
+  private var continuation: CheckedContinuation<(url: URL, duration: Double), Error>?
   private var file: AVAudioFile?
   private var frames: AVAudioFramePosition = 0
   private var sampleRate: Double = 22050
@@ -77,7 +77,7 @@ private final class NarrationWriter: NSObject {
   private var finished = false
   private var onFinish: (() -> Void)?
 
-  init(output: URL, continuation: CheckedContinuation<(URL, Double), Error>) {
+  init(output: URL, continuation: CheckedContinuation<(url: URL, duration: Double), Error>) {
     self.output = output
     self.continuation = continuation
   }
@@ -133,7 +133,7 @@ private final class NarrationWriter: NSObject {
       return
     }
     finished = true
-    continuation?.resume(returning: (output, duration))
+    continuation?.resume(returning: (url: output, duration: duration))
     continuation = nil
     scheduleFinish()
   }

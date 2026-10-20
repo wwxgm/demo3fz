@@ -4,15 +4,12 @@ import CoreImage
 enum LookFilter {
   private static let context = CIContext()
 
-  static func install(_ composition: AVMutableVideoComposition, name: String) {
-    guard name != "none" else {
-      return
-    }
-    composition.applyingCIFiltersWithHandler { request in
+  static func composition(asset: AVAsset, name: String) -> AVVideoComposition {
+    AVVideoComposition(asset: asset, applyingCIFiltersWithHandler: { request in
       let source = request.sourceImage
       let output = filtered(source, name: name).cropped(to: source.extent)
       request.finish(with: output, context: context)
-    }
+    })
   }
 
   private static func filtered(_ image: CIImage, name: String) -> CIImage {
