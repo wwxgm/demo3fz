@@ -2,7 +2,7 @@
   "expo": {
     "name": "IphoneHello",
     "slug": "iphone-hello",
-    "version": "1.1.0",
+    "version": "1.6.0",
     "orientation": "portrait",
     "icon": "./assets/icon.png",
     "userInterfaceStyle": "light",
@@ -15,11 +15,11 @@
     "ios": {
       "supportsTablet": false,
       "bundleIdentifier": "com.local.iphonehello",
-      "buildNumber": "2",
+      "buildNumber": "7",
       "infoPlist": {
         "CFBundleDisplayName": "视频翻转",
-        "NSPhotoLibraryUsageDescription": "需要访问相册，以选择视频并把翻转后的视频保存到相册。",
-        "NSPhotoLibraryAddUsageDescription": "需要把水平翻转后的视频保存到你的手机相册。",
+        "NSPhotoLibraryUsageDescription": "需要访问相册，以选择图片或视频，并把处理后的文件保存到相册。",
+        "NSPhotoLibraryAddUsageDescription": "需要把处理后的图片和视频保存到你的手机相册。",
         "ITSAppUsesNonExemptEncryption": false
       }
     },
@@ -37,7 +37,7 @@
       [
         "expo-image-picker",
         {
-          "photosPermission": "需要访问相册，以选择要水平翻转的视频。",
+          "photosPermission": "需要访问相册，以选择要处理的图片或视频。",
           "cameraPermission": false,
           "microphonePermission": false
         }
@@ -45,8 +45,8 @@
       [
         "expo-media-library",
         {
-          "photosPermission": "需要访问相册，以选择视频并把翻转后的视频保存到相册。",
-          "savePhotosPermission": "需要把水平翻转后的视频保存到你的手机相册。",
+          "photosPermission": "需要访问相册，以选择图片或视频，并把处理后的文件保存到相册。",
+          "savePhotosPermission": "需要把处理后的图片和视频保存到你的手机相册。",
           "isAccessMediaLocationEnabled": false
         }
       ]
