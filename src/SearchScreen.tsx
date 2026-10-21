@@ -30,6 +30,7 @@ import {
   runWithLimit,
   watermarkPayload,
 } from './runtime';
+import { useTheme } from './theme';
 
 type Origin = '搜索' | '相册' | '文件';
 
@@ -59,49 +60,209 @@ function baseName(uri: string, fallback: string) {
   }
 }
 
-async function searchImages(query: string, page: number) {
-  const url = `https://api.openverse.org/v1/images/?q=${encodeURIComponent(query)}&page=${page}&page_size=30&mature=false`;
-  const response = await fetch(url, {
-    headers: {
-      Accept: 'application/json',
-      'User-Agent': 'VideoFlip/1.2',
-    },
-  });
-  if (!response.ok) {
-    throw new Error('搜索失败，请检查网络');
+type Engine = 'baidu' | 'google' | 'bing' | 'sogou';
+
+const ENGINES: Array<{ id: Engine; label: string }> = [
+  { id: 'baidu', label: '百度图片' },
+  { id: 'google', label: '谷歌图片' },
+  { id: 'bing', label: '必应图片' },
+  { id: 'sogou', label: '搜狗图片' },
+];
+
+const BROWSER_HEADERS = {
+  Accept: 'application/json,text/plain,text/html,*/*',
+  'Accept-Language': 'zh-CN,zh;q=0.9',
+  'User-Agent':
+    'Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Mobile/15E148 Safari/604.1',
+};
+
+function decodeText(value: string) {
+  return value
+    .replace(/&quot;/g, '"')
+    .replace(/&amp;/g, '&')
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&#(\d+);/g, (_, code) => String.fromCharCode(Number(code)))
+    .replace(/\\u003d/g, '=')
+    .replace(/\\u0026/g, '&')
+    .replace(/\\\//g, '/');
+}
+
+function httpsUrl(value: unknown) {
+  if (typeof value !== 'string') return '';
+  const trimmed = value.trim();
+  if (trimmed.startsWith('https://')) return trimmed;
+  if (trimmed.startsWith('http://')) return `https://${trimmed.slice('http://'.length)}`;
+  return '';
+}
+
+function asNumber(value: unknown) {
+  const number = Number(value);
+  return Number.isFinite(number) && number > 0 ? number : undefined;
+}
+
+async function readSite(url: string, referer: string) {
+  let response: Response;
+  try {
+    response = await fetch(url, { headers: { ...BROWSER_HEADERS, Referer: referer } });
+  } catch (error) {
+    throw new Error(`没有连上接口\n${url}\n${errorText(error)}`);
   }
-  const data = (await response.json()) as {
-    page_count?: number;
-    results?: Array<{
-      id?: string;
-      title?: string;
-      url?: string;
-      thumbnail?: string | null;
-      width?: number;
-      height?: number;
-    }>;
-  };
+  const text = await response.text();
+  if (!response.ok) {
+    throw new Error(`接口返回 HTTP ${response.status}\n${url}\n${text.slice(0, 500)}`);
+  }
+  return text;
+}
+
+function pageCountFor(count: number, page: number, reported?: number) {
+  if (reported && reported > 0) return Math.min(20, Math.max(page, Math.ceil(reported / 30)));
+  return count >= 30 ? page + 1 : page;
+}
+
+function pushImage(images: WorkImage[], item: Omit<WorkImage, 'origin'>) {
+  if (!item.uri.startsWith('https://') && !item.previewUri.startsWith('https://')) return;
+  images.push({ ...item, origin: '搜索', uri: item.uri || item.previewUri, previewUri: item.previewUri || item.uri });
+}
+
+async function searchBaidu(query: string, page: number) {
+  const word = encodeURIComponent(query);
+  const offset = (page - 1) * 30;
+  const url =
+    `https://image.baidu.com/search/acjson?tn=resultjson_com&ipn=rj&ct=201326592&fp=result` +
+    `&queryWord=${word}&word=${word}&cl=2&lm=-1&ie=utf-8&oe=utf-8&pn=${offset}&rn=30`;
+  const text = await readSite(url, 'https://image.baidu.com/');
+  let data: { displayNum?: number; listNum?: number; data?: unknown };
+  try {
+    data = JSON.parse(text) as { displayNum?: number; listNum?: number; data?: unknown };
+  } catch {
+    throw new Error(`百度没有返回图片数据\n${url}\n${text.slice(0, 500)}`);
+  }
+  const rows = Array.isArray(data.data) ? data.data : [];
   const images: WorkImage[] = [];
-  for (const item of data.results ?? []) {
-    if (!item.url || !item.id) continue;
-    const thumb = item.thumbnail && item.thumbnail.startsWith('http') ? item.thumbnail : item.url;
-    images.push({
-      id: item.id,
-      uri: item.url,
-      previewUri: thumb,
-      name: item.title || '图片',
-      width: item.width,
-      height: item.height,
-      origin: '搜索',
+  rows.forEach((row, index) => {
+    if (!row || typeof row !== 'object') return;
+    const item = row as Record<string, unknown>;
+    const preview = httpsUrl(item.thumbURL) || httpsUrl(item.middleURL) || httpsUrl(item.hoverURL);
+    const full = httpsUrl(item.objURL) || httpsUrl(item.middleURL) || preview;
+    const title = typeof item.fromPageTitleEnc === 'string' ? decodeText(item.fromPageTitleEnc) : '百度图片';
+    pushImage(images, {
+      id: `baidu-${page}-${index}`,
+      uri: full,
+      previewUri: preview || full,
+      name: title || '百度图片',
+      width: asNumber(item.width),
+      height: asNumber(item.height),
+    });
+  });
+  if (images.length === 0) {
+    throw new Error(`百度这次没有解析出图片\n${url}\n${text.slice(0, 500)}`);
+  }
+  return { images, pageCount: pageCountFor(images.length, page, Number(data.displayNum || data.listNum || 0)) };
+}
+
+async function searchBing(query: string, page: number) {
+  const first = (page - 1) * 30 + 1;
+  const url = `https://www.bing.com/images/async?q=${encodeURIComponent(query)}&first=${first}&count=30&mmasync=1`;
+  const text = await readSite(url, 'https://www.bing.com/images/');
+  const images: WorkImage[] = [];
+  const matches = text.matchAll(/m="([^"]+)"/g);
+  let index = 0;
+  for (const match of matches) {
+    try {
+      const item = JSON.parse(decodeText(match[1])) as { murl?: string; turl?: string; t?: string };
+      const full = httpsUrl(item.murl);
+      const preview = httpsUrl(item.turl) || full;
+      if (!full && !preview) continue;
+      pushImage(images, {
+        id: `bing-${page}-${index}`,
+        uri: full || preview,
+        previewUri: preview || full,
+        name: item.t || '必应图片',
+      });
+      index += 1;
+    } catch {
+      continue;
+    }
+  }
+  if (images.length === 0) {
+    throw new Error(`必应没有解析出图片\n${url}\n${text.slice(0, 500)}`);
+  }
+  return { images, pageCount: pageCountFor(images.length, page) };
+}
+
+async function searchSogou(query: string, page: number) {
+  const start = (page - 1) * 30;
+  const url = `https://pic.sogou.com/napi/pc/searchList?mode=1&start=${start}&xml_len=30&query=${encodeURIComponent(query)}`;
+  const text = await readSite(url, 'https://pic.sogou.com/');
+  let data: { data?: { items?: unknown; totalNum?: number } };
+  try {
+    data = JSON.parse(text) as { data?: { items?: unknown; totalNum?: number } };
+  } catch {
+    throw new Error(`搜狗没有返回图片数据\n${url}\n${text.slice(0, 500)}`);
+  }
+  const rows = Array.isArray(data.data?.items) ? data.data?.items : [];
+  const images: WorkImage[] = [];
+  rows.forEach((row, index) => {
+    if (!row || typeof row !== 'object') return;
+    const item = row as Record<string, unknown>;
+    const full = httpsUrl(item.picUrl) || httpsUrl(item.locImageLink);
+    const preview = httpsUrl(item.thumbUrl) || full;
+    const title = typeof item.title === 'string' ? decodeText(item.title) : '搜狗图片';
+    pushImage(images, {
+      id: `sogou-${page}-${index}`,
+      uri: full || preview,
+      previewUri: preview || full,
+      name: title || '搜狗图片',
+      width: asNumber(item.width),
+      height: asNumber(item.height),
+    });
+  });
+  if (images.length === 0) {
+    throw new Error(`搜狗这次没有解析出图片\n${url}\n${text.slice(0, 500)}`);
+  }
+  return { images, pageCount: pageCountFor(images.length, page, Number(data.data?.totalNum || 0)) };
+}
+
+async function searchGoogle(query: string, page: number) {
+  const start = (page - 1) * 30;
+  const url = `https://www.google.com/search?tbm=isch&hl=zh-CN&q=${encodeURIComponent(query)}&ijn=${page - 1}&start=${start}`;
+  const text = await readSite(url, 'https://www.google.com/');
+  const originals = [...text.matchAll(/"ou":"(https?:[^"]+)"/g)].map((item) => httpsUrl(decodeText(item[1])));
+  const thumbs = [...text.matchAll(/"(https:\/\/encrypted-tbn0\.gstatic\.com\/images\?[^"]+)"/g)].map((item) =>
+    httpsUrl(decodeText(item[1])),
+  );
+  const images: WorkImage[] = [];
+  const count = Math.max(originals.length, thumbs.length);
+  for (let index = 0; index < count && images.length < 30; index += 1) {
+    const full = originals[index] || thumbs[index] || '';
+    const preview = thumbs[index] || full;
+    pushImage(images, {
+      id: `google-${page}-${index}`,
+      uri: full || preview,
+      previewUri: preview || full,
+      name: '谷歌图片',
     });
   }
-  const pageCount = data.page_count && data.page_count > 0 ? data.page_count : images.length >= 30 ? page + 1 : page;
-  return { images, pageCount };
+  if (images.length === 0) {
+    throw new Error(`谷歌没有返回图片。手机直接请求经常会被谷歌拦住。\n${url}\n${text.slice(0, 500)}`);
+  }
+  return { images, pageCount: pageCountFor(images.length, page) };
+}
+
+async function searchImages(engine: Engine, query: string, page: number) {
+  if (engine === 'baidu') return searchBaidu(query, page);
+  if (engine === 'bing') return searchBing(query, page);
+  if (engine === 'sogou') return searchSogou(query, page);
+  return searchGoogle(query, page);
 }
 
 export function SearchScreen() {
   const insets = useSafeAreaInsets();
+  const { color: accent } = useTheme();
   const [query, setQuery] = useState('');
+  const [engine, setEngine] = useState<Engine>('baidu');
+  const [logs, setLogs] = useState<string[]>([]);
   const [page, setPage] = useState(1);
   const [pageCount, setPageCount] = useState(1);
   const [results, setResults] = useState<WorkImage[]>([]);
@@ -126,25 +287,37 @@ export function SearchScreen() {
     chosen[0] ??
     null;
 
+  const addLog = (line: string) => {
+    const now = new Date();
+    const clock = [now.getHours(), now.getMinutes(), now.getSeconds()].map((part) => String(part).padStart(2, '0')).join(':');
+    setLogs((prev) => [...prev, `${clock}  ${line}`].slice(-80));
+  };
+
   const runSearch = async (nextPage: number) => {
     const keyword = query.trim();
+    const current = ENGINES.find((item) => item.id === engine);
     if (!keyword) {
       Alert.alert('请输入关键词');
       return;
     }
     setLoading(true);
     setMessage('');
+    addLog(`开始用${current?.label ?? '百度图片'}搜索「${keyword}」，第 ${nextPage} 页`);
     try {
-      const found = await searchImages(keyword, nextPage);
+      const found = await searchImages(engine, keyword, nextPage);
       setResults(found.images);
       setPage(nextPage);
       setPageCount(found.pageCount);
       if (nextPage === 1) {
         setChosen((prev) => prev.filter((item) => item.origin !== '搜索'));
       }
+      addLog(`返回 ${found.images.length} 张图片`);
       if (found.images.length === 0) setMessage('没有找到图片');
     } catch (error) {
-      Alert.alert('搜索失败', errorText(error));
+      const detail = errorText(error);
+      addLog(detail);
+      setMessage('搜索失败，详情在错误日志里');
+      Alert.alert('搜索失败', '接口没有返回可用图片，错误日志可以滚动查看。');
     } finally {
       setLoading(false);
     }
@@ -320,7 +493,19 @@ export function SearchScreen() {
   return (
     <View style={[styles.screen, { paddingTop: insets.top + 8 }]}>
       <Text style={styles.title}>搜索</Text>
-      <Text style={styles.subtitle}>输入关键词，每页 30 张。单击选择，双击预览。</Text>
+      <Text style={styles.subtitle}>默认搜索百度图片。单击选择，双击预览。</Text>
+      <View style={styles.engineRow}>
+        {ENGINES.map((item) => (
+          <Pressable
+            key={item.id}
+            disabled={busy}
+            style={[styles.engineChip, engine === item.id && styles.engineChipOn, engine === item.id && { backgroundColor: accent }]}
+            onPress={() => setEngine(item.id)}
+          >
+            <Text style={styles.engineText}>{item.label}</Text>
+          </Pressable>
+        ))}
+      </View>
       <View style={styles.searchRow}>
         <TextInput
           value={query}
@@ -331,10 +516,27 @@ export function SearchScreen() {
           returnKeyType="search"
           onSubmitEditing={() => void runSearch(1)}
         />
-        <Pressable style={styles.searchButton} disabled={busy} onPress={() => void runSearch(1)}>
+        <Pressable style={[styles.searchButton, { backgroundColor: accent }]} disabled={busy} onPress={() => void runSearch(1)}>
           {loading ? <ActivityIndicator color="#F4F7FB" /> : <Text style={styles.searchText}>搜索</Text>}
         </Pressable>
       </View>
+      {logs.length > 0 ? (
+        <View style={styles.logBox}>
+          <View style={styles.logHead}>
+            <Text style={styles.optionLabel}>错误日志</Text>
+            <Pressable onPress={() => setLogs([])} hitSlop={8}>
+              <Text style={styles.link}>清空</Text>
+            </Pressable>
+          </View>
+          <ScrollView style={styles.logScroll} nestedScrollEnabled>
+            {logs.map((line, index) => (
+              <Text key={`${index}-${line.slice(0, 12)}`} style={styles.logLine}>
+                {line}
+              </Text>
+            ))}
+          </ScrollView>
+        </View>
+      ) : null}
       <ScrollView style={styles.scroll} contentContainerStyle={styles.scrollContent} keyboardShouldPersistTaps="handled">
         <View style={styles.optionCard}>
           <View style={styles.optionRow}>
@@ -342,7 +544,7 @@ export function SearchScreen() {
             <Switch
               value={batch}
               onValueChange={setBatch}
-              trackColor={{ false: 'rgba(255,255,255,0.15)', true: '#1F6FEB' }}
+              trackColor={{ false: 'rgba(255,255,255,0.15)', true: accent }}
             />
           </View>
           <View style={styles.optionRow}>
@@ -350,7 +552,7 @@ export function SearchScreen() {
             <Switch
               value={flip}
               onValueChange={setFlip}
-              trackColor={{ false: 'rgba(255,255,255,0.15)', true: '#1F6FEB' }}
+              trackColor={{ false: 'rgba(255,255,255,0.15)', true: accent }}
             />
           </View>
           <Text style={styles.optionHint}>
@@ -452,7 +654,7 @@ export function SearchScreen() {
         <Pressable style={styles.secondaryWide} disabled={busy || chosen.length === 0} onPress={() => void saveAll('original')}>
           <Text style={styles.secondaryText}>保存原图到相册</Text>
         </Pressable>
-        <Pressable style={styles.primary} disabled={busy || chosen.length === 0} onPress={() => void saveAll('process')}>
+        <Pressable style={[styles.primary, { backgroundColor: accent }]} disabled={busy || chosen.length === 0} onPress={() => void saveAll('process')}>
           {running ? <ActivityIndicator color="#F4F7FB" /> : <Text style={styles.primaryText}>处理并保存</Text>}
         </Pressable>
       </View>
@@ -518,6 +720,49 @@ const styles = StyleSheet.create({
     color: '#F4F7FB',
     fontSize: 16,
     fontWeight: '700',
+  },
+  engineRow: {
+    marginTop: 10,
+    flexDirection: 'row',
+    flexWrap: 'wrap',
+    gap: 8,
+  },
+  engineChip: {
+    minHeight: 32,
+    paddingHorizontal: 12,
+    borderRadius: 16,
+    alignItems: 'center',
+    justifyContent: 'center',
+    backgroundColor: 'rgba(255,255,255,0.08)',
+  },
+  engineChipOn: {
+    backgroundColor: '#1F6FEB',
+  },
+  engineText: {
+    color: '#F4F7FB',
+    fontSize: 13,
+    fontWeight: '700',
+  },
+  logBox: {
+    marginTop: 10,
+    borderRadius: 12,
+    padding: 10,
+    backgroundColor: 'rgba(255,255,255,0.06)',
+    gap: 8,
+  },
+  logHead: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+  },
+  logScroll: {
+    maxHeight: 180,
+  },
+  logLine: {
+    color: '#F0D0A8',
+    fontSize: 12,
+    lineHeight: 18,
+    marginBottom: 8,
   },
   scroll: {
     flex: 1,

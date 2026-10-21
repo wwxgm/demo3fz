@@ -20,6 +20,7 @@ import VideoFlip from '../modules/video-flip';
 import { CropEditor } from './CropEditor';
 import { MergeScreen } from './MergeScreen';
 import { WatermarkForm } from './WatermarkForm';
+import { useTheme } from './theme';
 import {
   CropNorm,
   ItemStatus,
@@ -82,6 +83,7 @@ function formatDuration(durationMs?: number) {
 
 export function MediaScreen() {
   const insets = useSafeAreaInsets();
+  const { color: accent } = useTheme();
   const [kind, setKind] = useState<Kind>('video');
   const [videos, setVideos] = useState<MediaItem[]>([]);
   const [images, setImages] = useState<MediaItem[]>([]);
@@ -260,6 +262,16 @@ export function MediaScreen() {
     const allowed = await ensurePermission();
     if (!allowed) return;
 
+    const heavy =
+      kind === 'video' &&
+      (watermark.enabled ||
+        filterOn ||
+        extendVideo ||
+        followOn ||
+        sampleFrames ||
+        zoom > 1 ||
+        subtitleScript.trim().length > 0);
+
     setRunning(true);
     setSummary('');
     let saved = 0;
@@ -268,7 +280,7 @@ export function MediaScreen() {
     const mark = watermarkPayload(watermark);
     const subtitleLines = subtitleScript.split(/\r?\n/);
 
-    await runWithLimit(queue, 2, async (item) => {
+    await runWithLimit(queue, heavy ? 1 : 2, async (item) => {
       setItems((prev) =>
         prev.map((it) => (it.id === item.id ? { ...it, status: 'processing', message: '正在处理…' } : it)),
       );
@@ -317,7 +329,11 @@ export function MediaScreen() {
             prev.map((it) => (it.id === item.id ? { ...it, status: 'saving', message: '正在保存到相册…' } : it)),
           );
           for (const frame of frameUris) {
-            await MediaLibrary.createAssetAsync(frame);
+            try {
+              await MediaLibrary.createAssetAsync(frame);
+            } catch {
+              // 抽帧失败不影响视频本身保存。
+            }
             VideoFlip.removeTempFile(frame);
           }
           await MediaLibrary.createAssetAsync(outputUri);
@@ -453,7 +469,7 @@ export function MediaScreen() {
               {[1, 1.1, 1.2].map((value) => (
                 <Pressable
                   key={value}
-                  style={[styles.zoomChip, zoom === value && styles.zoomChipOn]}
+                  style={[styles.zoomChip, zoom === value && styles.zoomChipOn, zoom === value && { backgroundColor: accent }]}
                   onPress={() => setZoom(value)}
                 >
                   <Text style={styles.zoomText}>{value === 1 ? '不放大' : `${value}`}</Text>
@@ -477,7 +493,7 @@ export function MediaScreen() {
               <Switch
                 value={sampleFrames}
                 onValueChange={setSampleFrames}
-                trackColor={{ false: 'rgba(255,255,255,0.15)', true: '#1F6FEB' }}
+                trackColor={{ false: 'rgba(255,255,255,0.15)', true: accent }}
               />
             </View>
             <View style={styles.optionRow}>
@@ -485,7 +501,7 @@ export function MediaScreen() {
               <Switch
                 value={extendVideo}
                 onValueChange={setExtendVideo}
-                trackColor={{ false: 'rgba(255,255,255,0.15)', true: '#1F6FEB' }}
+                trackColor={{ false: 'rgba(255,255,255,0.15)', true: accent }}
               />
             </View>
             {extendVideo ? (
@@ -495,7 +511,7 @@ export function MediaScreen() {
                   <Switch
                     value={useCurrentClip}
                     onValueChange={setUseCurrentClip}
-                    trackColor={{ false: 'rgba(255,255,255,0.15)', true: '#1F6FEB' }}
+                    trackColor={{ false: 'rgba(255,255,255,0.15)', true: accent }}
                   />
                 </View>
                 <View style={styles.timeRow}>
@@ -516,7 +532,7 @@ export function MediaScreen() {
                   ).map(([mode, label]) => (
                     <Pressable
                       key={mode}
-                      style={[styles.zoomChip, highlightMode === mode && styles.zoomChipOn]}
+                      style={[styles.zoomChip, highlightMode === mode && styles.zoomChipOn, highlightMode === mode && { backgroundColor: accent }]}
                       onPress={() => setHighlightMode(mode)}
                     >
                       <Text style={styles.zoomText}>{label}</Text>
@@ -533,7 +549,7 @@ export function MediaScreen() {
               <Switch
                 value={filterOn}
                 onValueChange={setFilterOn}
-                trackColor={{ false: 'rgba(255,255,255,0.15)', true: '#1F6FEB' }}
+                trackColor={{ false: 'rgba(255,255,255,0.15)', true: accent }}
               />
             </View>
             {filterOn ? (
@@ -548,7 +564,7 @@ export function MediaScreen() {
                 ).map(([name, label]) => (
                   <Pressable
                     key={name}
-                    style={[styles.zoomChip, filterName === name && styles.zoomChipOn]}
+                    style={[styles.zoomChip, filterName === name && styles.zoomChipOn, filterName === name && { backgroundColor: accent }]}
                     onPress={() => setFilterName(name)}
                   >
                     <Text style={styles.zoomText}>{label}</Text>
@@ -562,7 +578,7 @@ export function MediaScreen() {
               <Switch
                 value={followOn}
                 onValueChange={setFollowOn}
-                trackColor={{ false: 'rgba(255,255,255,0.15)', true: '#1F6FEB' }}
+                trackColor={{ false: 'rgba(255,255,255,0.15)', true: accent }}
               />
             </View>
             {followOn ? (
@@ -592,7 +608,7 @@ export function MediaScreen() {
               <Switch
                 value={flipImages}
                 onValueChange={setFlipImages}
-                trackColor={{ false: 'rgba(255,255,255,0.15)', true: '#1F6FEB' }}
+                trackColor={{ false: 'rgba(255,255,255,0.15)', true: accent }}
               />
             </View>
             <View style={styles.optionRow}>
@@ -695,7 +711,7 @@ export function MediaScreen() {
       {summary ? <Text style={styles.summary}>{summary}</Text> : null}
       <View style={styles.footer}>
         <Pressable
-          style={[styles.primary, (busy || pendingCount === 0) && styles.primaryDisabled]}
+          style={[styles.primary, { backgroundColor: accent }, (busy || pendingCount === 0) && styles.primaryDisabled]}
           disabled={busy || pendingCount === 0}
           onPress={() => void run()}
         >

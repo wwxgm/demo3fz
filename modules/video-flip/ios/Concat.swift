@@ -49,10 +49,16 @@ enum Concat {
       throw ConcatError.message("系统无法拼接视频")
     }
     videoTrack.preferredTransform = .identity
-    let audioTrack = composition.addMutableTrack(
-      withMediaType: .audio,
-      preferredTrackID: kCMPersistentTrackID_Invalid
-    )
+    let hasAudio = pieces.contains { $0.audio != nil }
+    let audioTrack: AVMutableCompositionTrack?
+    if hasAudio {
+      audioTrack = composition.addMutableTrack(
+        withMediaType: .audio,
+        preferredTrackID: kCMPersistentTrackID_Invalid
+      )
+    } else {
+      audioTrack = nil
+    }
 
     let layer = AVMutableVideoCompositionLayerInstruction(assetTrack: videoTrack)
     var cursor = CMTime.zero
@@ -80,6 +86,7 @@ enum Concat {
     videoComposition.renderSize = canvas
     videoComposition.frameDuration = CMTime(value: 1, timescale: 30)
     videoComposition.sourceTrackIDForFrameTiming = videoTrack.trackID
+    applyRec709(videoComposition)
 
     let output = FileManager.default.temporaryDirectory.appendingPathComponent("joined-\(UUID().uuidString).mp4")
     try await export(composition: composition, videoComposition: videoComposition, output: output)

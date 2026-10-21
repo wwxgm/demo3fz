@@ -17,6 +17,14 @@ import * as DocumentPicker from 'expo-document-picker';
 import * as MediaLibrary from 'expo-media-library';
 import VideoFlip from '../modules/video-flip';
 import { errorText } from './runtime';
+import { useTheme } from './theme';
+
+const SAMPLE_SCRIPT = `全网汉堡前五排行榜！看看有没有你的本命🍔
+第5名 华莱士｜汉堡界性价比卷王！十几块直接吃到撑，香辣鸡腿堡经典，学生党夜宵首选，缺点品控看运气
+第4名 肯德基香辣鸡腿堡｜炸鸡底子是真稳，肉嫩入味，沙拉酱调得很舒服，几十年不出错，闭眼冲不踩雷
+第3名 麦当劳板烧鸡腿堡｜麦门本命！鸡腿肉嫩到爆汁，不腻不辣，清淡党无限回购，稳定到离谱
+第2名 汉堡王皇堡｜炭烤牛肉香直接拉满！厚牛肉饼，烟熏风味，爱吃牛肉堡的很难拒绝
+第1名 塔斯汀香辣鸡腿堡｜国产汉堡黑马！现烤中国饼皮，有嚼劲，刚出炉香到上头！`;
 
 const VIDEO_EXT = /\.(mp4|mov|m4v|avi|mkv|webm|3gp|mpeg|mpg)$/i;
 
@@ -36,7 +44,8 @@ function baseName(uri: string, fallback: string) {
 
 export function PosterScreen() {
   const insets = useSafeAreaInsets();
-  const [script, setScript] = useState('');
+  const { color } = useTheme();
+  const [script, setScript] = useState(SAMPLE_SCRIPT);
   const [background, setBackground] = useState<{ uri: string; name: string } | null>(null);
   const [busy, setBusy] = useState(false);
 
@@ -120,7 +129,7 @@ export function PosterScreen() {
   return (
     <View style={[styles.screen, { paddingTop: insets.top + 8 }]}>
       <Text style={styles.title}>大字报</Text>
-      <Text style={styles.subtitle}>一行一句，字会逐行翻转出来。行距收紧，背景视频按原速播放。</Text>
+      <Text style={styles.subtitle}>第一行是标题。后面每行写成「第5名 名字｜一句介绍」，会按抖音排行榜一条条翻出来。</Text>
       <ScrollView style={styles.list} contentContainerStyle={styles.listContent} keyboardShouldPersistTaps="handled">
         <TextInput
           value={script}
@@ -131,7 +140,7 @@ export function PosterScreen() {
           editable={!busy}
           style={styles.script}
         />
-        <Text style={styles.hint}>超过 8 个字会自动换行。不上传背景时，用黑底竖屏。</Text>
+        <Text style={styles.hint}>标题先出现，然后从第 5 名播到第 1 名。竖线后面是介绍。有背景视频时按原速播放。</Text>
         <View style={styles.actions}>
           <Pressable style={styles.secondary} disabled={busy} onPress={() => void pickLibrary()}>
             <Text style={styles.secondaryText}>相册背景</Text>
@@ -151,7 +160,7 @@ export function PosterScreen() {
           ) : null}
         </View>
       </ScrollView>
-      <Pressable style={[styles.primary, busy && styles.primaryDisabled]} disabled={busy} onPress={() => void make()}>
+      <Pressable style={[styles.primary, { backgroundColor: color }, busy && styles.primaryDisabled]} disabled={busy} onPress={() => void make()}>
         {busy ? <ActivityIndicator color="#F4F7FB" /> : <Text style={styles.primaryText}>制作并保存</Text>}
       </Pressable>
     </View>
@@ -183,13 +192,13 @@ const styles = StyleSheet.create({
     paddingBottom: 16,
   },
   script: {
-    minHeight: 180,
+    minHeight: 260,
     borderRadius: 12,
     paddingHorizontal: 12,
     paddingVertical: 12,
     color: '#F4F7FB',
     backgroundColor: 'rgba(255,255,255,0.08)',
-    fontSize: 18,
+    fontSize: 16,
     fontWeight: '600',
     textAlignVertical: 'top',
   },

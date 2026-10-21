@@ -13,6 +13,7 @@ import {
 } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { CropNorm } from './runtime';
+import { useTheme } from './theme';
 
 type Props = {
   uri: string;
@@ -45,6 +46,7 @@ function clampCrop(crop: CropNorm): CropNorm {
 
 export function CropEditor({ uri, initial, onCancel, onConfirm }: Props) {
   const insets = useSafeAreaInsets();
+  const { color: accent } = useTheme();
   const [pixel, setPixel] = useState({ width: 0, height: 0 });
   const [stage, setStage] = useState({ width: 0, height: 0 });
   const [crop, setCrop] = useState<CropNorm>(initial ?? { x: 0.1, y: 0.1, width: 0.8, height: 0.8 });
@@ -197,7 +199,7 @@ export function CropEditor({ uri, initial, onCancel, onConfirm }: Props) {
           <Pressable style={styles.secondary} onPress={onCancel}>
             <Text style={styles.secondaryText}>取消</Text>
           </Pressable>
-          <Pressable style={styles.primary} onPress={() => onConfirm(clampCrop(cropRef.current))}>
+          <Pressable style={[styles.primary, { backgroundColor: accent }]} onPress={() => onConfirm(clampCrop(cropRef.current))}>
             <Text style={styles.primaryText}>使用这个裁剪</Text>
           </Pressable>
         </View>

@@ -15,6 +15,7 @@ import * as ImagePicker from 'expo-image-picker';
 import * as DocumentPicker from 'expo-document-picker';
 import * as MediaLibrary from 'expo-media-library';
 import VideoFlip from '../modules/video-flip';
+import { useTheme } from './theme';
 import { errorText } from './runtime';
 
 type Clip = {
@@ -41,6 +42,7 @@ function baseName(uri: string, fallback: string) {
 
 export function MergeScreen({ onClose }: { onClose: () => void }) {
   const insets = useSafeAreaInsets();
+  const { color: accent } = useTheme();
   const [clips, setClips] = useState<Clip[]>([]);
   const [busy, setBusy] = useState(false);
 
@@ -188,7 +190,7 @@ export function MergeScreen({ onClose }: { onClose: () => void }) {
         )}
       </ScrollView>
       <Pressable
-        style={[styles.primary, (busy || clips.length < 2) && styles.primaryDisabled]}
+        style={[styles.primary, { backgroundColor: accent }, (busy || clips.length < 2) && styles.primaryDisabled]}
         disabled={busy || clips.length < 2}
         onPress={() => void merge()}
       >

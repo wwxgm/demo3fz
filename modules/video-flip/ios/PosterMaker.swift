@@ -14,12 +14,24 @@ enum PosterError: LocalizedError {
 
 enum PosterMaker {
   static func make(script: String, backgroundUri: String) async throws -> String {
-    let rows = lines(from: script)
-    guard !rows.isEmpty else {
-      throw PosterError.message("请先输入文案")
-    }
-    guard rows.count <= 16 else {
-      throw PosterError.message("文案最多 16 行，请删短一点")
+    let cards = storyCards(from: script)
+    let ranked = cards.contains(where: { $0.rank })
+    let rows = ranked ? [] : lines(from: script)
+    if ranked {
+      let rankCount = cards.filter { $0.rank }.count
+      guard rankCount > 0 else {
+        throw PosterError.message("请先输入文案")
+      }
+      guard rankCount <= 10 else {
+        throw PosterError.message("排行最多 10 名")
+      }
+    } else {
+      guard !rows.isEmpty else {
+        throw PosterError.message("请先输入文案")
+      }
+      guard rows.count <= 16 else {
+        throw PosterError.message("文案最多 16 行，请删短一点")
+      }
     }
 
     let trimmedBackground = backgroundUri.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -37,7 +49,9 @@ enum PosterMaker {
     let transform: CGAffineTransform
     let timeline: CMTime
     if trimmedBackground.isEmpty {
-      let seconds = timing(lineCount: rows.count, limit: nil).total
+      let seconds = ranked
+        ? 1.2 + Double(max(cards.filter { $0.rank }.count, 1)) * 3.4
+        : timing(lineCount: rows.count, limit: nil).total
       let size = CGSize(width: 1080, height: 1920)
       let url = try await writeBlack(size: size, seconds: seconds)
       baseFile = url
@@ -111,11 +125,188 @@ enum PosterMaker {
     videoComposition.renderSize = renderSize
     videoComposition.frameDuration = CMTime(value: 1, timescale: 30)
     videoComposition.sourceTrackIDForFrameTiming = compositionVideo.trackID
-    burn(rows, into: videoComposition, renderSize: renderSize, duration: insert.duration.seconds)
+    if ranked {
+      burnRanking(cards, into: videoComposition, renderSize: renderSize, duration: insert.duration.seconds)
+    } else {
+      burn(rows, into: videoComposition, renderSize: renderSize, duration: insert.duration.seconds)
+    }
 
     let output = FileManager.default.temporaryDirectory.appendingPathComponent("poster-\(UUID().uuidString).mp4")
     try await export(composition: composition, videoComposition: videoComposition, output: output)
     return output.absoluteString
+  }
+
+  private struct Card {
+    var headline: String
+    var body: String
+    var rank: Bool
+  }
+
+  private static func storyCards(from script: String) -> [Card] {
+    let normalized = script.replacingOccurrences(of: "\r\n", with: "\n").replacingOccurrences(of: "\r", with: "\n")
+    var cards: [Card] = []
+    var seenRank = false
+    for part in normalized.split(separator: "\n", omittingEmptySubsequences: true) {
+      let line = part.trimmingCharacters(in: .whitespacesAndNewlines)
+      if line.isEmpty {
+        continue
+      }
+      if line.range(of: #"^第[0-9]+名"#, options: .regularExpression) != nil {
+        seenRank = true
+        let pieces = line.contains("｜") ? line.components(separatedBy: "｜") : line.components(separatedBy: "|")
+        let headline = pieces[0].trimmingCharacters(in: .whitespaces)
+        let body = pieces.dropFirst().joined(separator: "｜").trimmingCharacters(in: .whitespaces)
+        cards.append(Card(headline: headline, body: body, rank: true))
+      } else if !seenRank {
+        if cards.isEmpty {
+          cards.append(Card(headline: line, body: "", rank: false))
+        } else {
+          cards[0].headline += line
+        }
+      } else if var last = cards.last, last.rank, last.body.isEmpty {
+        last.body = line
+        cards[cards.count - 1] = last
+      } else {
+        cards.append(Card(headline: line, body: "", rank: false))
+      }
+    }
+    return cards
+  }
+
+  private static func burnRanking(
+    _ cards: [Card],
+    into composition: AVMutableVideoComposition,
+    renderSize: CGSize,
+    duration: Double
+  ) {
+    let parent = CALayer()
+    let videoLayer = CALayer()
+    let canvas = CGRect(origin: .zero, size: renderSize)
+    parent.frame = canvas
+    videoLayer.frame = canvas
+    parent.isGeometryFlipped = true
+    parent.masksToBounds = true
+    var perspective = CATransform3DIdentity
+    perspective.m34 = -1 / 700
+    parent.sublayerTransform = perspective
+    parent.addSublayer(videoLayer)
+
+    let width = renderSize.width * 0.88
+    let ranks = cards.filter { $0.rank }
+    let title = cards.first(where: { !$0.rank })?.headline ?? ""
+    if !title.isEmpty {
+      let font = UIFont.systemFont(ofSize: renderSize.width * 0.058, weight: .black)
+      let box = wrappedSize(title, font: font, width: width)
+      let layer = textLayer(styled(title, font: font), size: box)
+      layer.position = CGPoint(x: renderSize.width / 2, y: renderSize.height * 0.1 + box.height / 2)
+      flip(layer, delay: 0.05, duration: 0.32)
+      parent.addSublayer(layer)
+    }
+
+    let lead = 0.9
+    let each = max((max(duration, 1) - lead) / Double(max(ranks.count, 1)), 0.8)
+    for (index, card) in ranks.enumerated() {
+      let start = lead + Double(index) * each
+      let end = index == ranks.count - 1 ? duration : start + each
+      let group = CALayer()
+      group.frame = canvas
+      let headFont = UIFont.systemFont(ofSize: renderSize.width * 0.064, weight: .black)
+      let bodyFont = UIFont.systemFont(ofSize: renderSize.width * 0.04, weight: .semibold)
+      let head = rankHeadline(card.headline, font: headFont, width: width)
+      let bodyBox = card.body.isEmpty ? .zero : wrappedSize(card.body, font: bodyFont, width: width)
+      let headLayer = textLayer(head.text, size: head.size)
+      let blockHeight = head.size.height + (bodyBox.height > 0 ? bodyBox.height + 18 : 0)
+      var cursor = (renderSize.height - blockHeight) / 2 + 20
+      headLayer.position = CGPoint(x: renderSize.width / 2, y: cursor + head.size.height / 2)
+      group.addSublayer(headLayer)
+      cursor += head.size.height + 18
+      if bodyBox.height > 0 {
+        let bodyLayer = textLayer(styled(card.body, font: bodyFont), size: bodyBox)
+        bodyLayer.position = CGPoint(x: renderSize.width / 2, y: cursor + bodyBox.height / 2)
+        group.addSublayer(bodyLayer)
+      }
+      hold(group, start: start, end: end, videoDuration: max(duration, end))
+      spinIn(group, delay: start)
+      parent.addSublayer(group)
+    }
+
+    composition.animationTool = AVVideoCompositionCoreAnimationTool(postProcessingAsVideoLayer: videoLayer, in: parent)
+  }
+
+  private static func rankHeadline(_ headline: String, font: UIFont, width: CGFloat) -> (text: NSAttributedString, size: CGSize) {
+    let paragraph = NSMutableParagraphStyle()
+    paragraph.alignment = .center
+    let text = NSMutableAttributedString()
+    let base: [NSAttributedString.Key: Any] = [
+      .font: font,
+      .strokeColor: UIColor.black,
+      .strokeWidth: -6,
+      .paragraphStyle: paragraph,
+    ]
+    if let match = headline.range(of: #"^第[0-9]+名"#, options: .regularExpression) {
+      var rankAttrs = base
+      rankAttrs[.foregroundColor] = UIColor(red: 1, green: 0.86, blue: 0.28, alpha: 1)
+      text.append(NSAttributedString(string: String(headline[match]), attributes: rankAttrs))
+      var nameAttrs = base
+      nameAttrs[.foregroundColor] = UIColor.white
+      text.append(NSAttributedString(string: String(headline[match.upperBound...]), attributes: nameAttrs))
+    } else {
+      var attrs = base
+      attrs[.foregroundColor] = UIColor.white
+      text.append(NSAttributedString(string: headline, attributes: attrs))
+    }
+    let bounds = text.boundingRect(
+      with: CGSize(width: width, height: 800),
+      options: [.usesLineFragmentOrigin, .usesFontLeading],
+      context: nil
+    )
+    return (text, CGSize(width: width, height: ceil(bounds.height) + 8))
+  }
+
+  private static func textLayer(_ string: NSAttributedString, size: CGSize) -> CATextLayer {
+    let layer = CATextLayer()
+    layer.string = string
+    layer.alignmentMode = .center
+    layer.contentsScale = 2
+    layer.isWrapped = true
+    layer.bounds = CGRect(origin: .zero, size: size)
+    layer.anchorPoint = CGPoint(x: 0.5, y: 0.5)
+    layer.shadowColor = UIColor.black.cgColor
+    layer.shadowOpacity = 0.85
+    layer.shadowRadius = 8
+    layer.shadowOffset = .zero
+    return layer
+  }
+
+  private static func wrappedSize(_ text: String, font: UIFont, width: CGFloat) -> CGSize {
+    let bounds = (text as NSString).boundingRect(
+      with: CGSize(width: width, height: 2000),
+      options: [.usesLineFragmentOrigin, .usesFontLeading],
+      attributes: [.font: font],
+      context: nil
+    )
+    return CGSize(width: width, height: ceil(bounds.height) + 8)
+  }
+
+  private static func hold(_ layer: CALayer, start: Double, end: Double, videoDuration: Double) {
+    let video = max(videoDuration, 0.4)
+    let begin = min(max(start / video, 0), 0.97)
+    let show = min(max((start + 0.28) / video, begin + 0.01), 0.98)
+    let hide = min(max(end / video, show + 0.01), 1)
+    let anim = CAKeyframeAnimation(keyPath: "opacity")
+    if hide >= 0.99 {
+      anim.values = [0, 0, 1, 1]
+      anim.keyTimes = [0, NSNumber(value: begin), NSNumber(value: show), 1]
+    } else {
+      anim.values = [0, 0, 1, 1, 0]
+      anim.keyTimes = [0, NSNumber(value: begin), NSNumber(value: show), NSNumber(value: hide), 1]
+    }
+    anim.duration = video
+    anim.beginTime = AVCoreAnimationBeginTimeAtZero
+    anim.fillMode = .both
+    anim.isRemovedOnCompletion = false
+    layer.opacity = 0
+    layer.add(anim, forKey: "poster-hold")
   }
 
   private static func burn(_ rows: [String], into composition: AVMutableVideoComposition, renderSize: CGSize, duration: Double) {
@@ -155,6 +346,19 @@ enum PosterMaker {
     }
 
     composition.animationTool = AVVideoCompositionCoreAnimationTool(postProcessingAsVideoLayer: videoLayer, in: parent)
+  }
+
+  private static func spinIn(_ layer: CALayer, delay: Double) {
+    layer.transform = CATransform3DMakeRotation(-.pi / 2, 1, 0, 0)
+    let spin = CABasicAnimation(keyPath: "transform.rotation.x")
+    spin.fromValue = -Double.pi / 2
+    spin.toValue = 0
+    spin.duration = 0.34
+    spin.beginTime = AVCoreAnimationBeginTimeAtZero + delay
+    spin.timingFunction = CAMediaTimingFunction(name: .easeOut)
+    spin.fillMode = .both
+    spin.isRemovedOnCompletion = false
+    layer.add(spin, forKey: "poster-flip")
   }
 
   private static func flip(_ layer: CALayer, delay: Double, duration: Double) {

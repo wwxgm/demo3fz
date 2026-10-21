@@ -1,5 +1,6 @@
 import { Pressable, StyleSheet, Switch, Text, TextInput, View } from 'react-native';
 import { WatermarkSettings } from './runtime';
+import { useTheme } from './theme';
 
 type Props = {
   value: WatermarkSettings;
@@ -7,6 +8,7 @@ type Props = {
 };
 
 export function WatermarkForm({ value, onChange }: Props) {
+  const { color: accent } = useTheme();
   const patch = (part: Partial<WatermarkSettings>) => onChange({ ...value, ...part });
 
   return (
@@ -16,7 +18,7 @@ export function WatermarkForm({ value, onChange }: Props) {
         <Switch
           value={value.enabled}
           onValueChange={(enabled) => patch({ enabled })}
-          trackColor={{ false: 'rgba(255,255,255,0.15)', true: '#1F6FEB' }}
+          trackColor={{ false: 'rgba(255,255,255,0.15)', true: accent }}
         />
       </View>
       {value.enabled ? (
@@ -45,7 +47,7 @@ export function WatermarkForm({ value, onChange }: Props) {
             <Switch
               value={value.move}
               onValueChange={(move) => patch({ move })}
-              trackColor={{ false: 'rgba(255,255,255,0.15)', true: '#1F6FEB' }}
+              trackColor={{ false: 'rgba(255,255,255,0.15)', true: accent }}
             />
           </View>
           <View style={styles.row}>
@@ -53,7 +55,7 @@ export function WatermarkForm({ value, onChange }: Props) {
             <Switch
               value={value.placeLeft}
               onValueChange={(placeLeft) => patch({ placeLeft })}
-              trackColor={{ false: 'rgba(255,255,255,0.15)', true: '#1F6FEB' }}
+              trackColor={{ false: 'rgba(255,255,255,0.15)', true: accent }}
             />
           </View>
           <View style={styles.row}>
@@ -61,7 +63,7 @@ export function WatermarkForm({ value, onChange }: Props) {
             <Switch
               value={value.placeCenter}
               onValueChange={(placeCenter) => patch({ placeCenter })}
-              trackColor={{ false: 'rgba(255,255,255,0.15)', true: '#1F6FEB' }}
+              trackColor={{ false: 'rgba(255,255,255,0.15)', true: accent }}
             />
           </View>
           <Text style={styles.hint}>默认不加水印。勾选后文字在左边和中央，颜色很淡，并轻微挪动。</Text>

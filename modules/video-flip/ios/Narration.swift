@@ -10,9 +10,32 @@ enum NarrationError: LocalizedError {
 
 actor Narration {
   static let shared = Narration()
+  private var busy = false
+  private var waiters: [CheckedContinuation<Void, Never>] = []
 
   func speak(_ text: String) async throws -> (url: URL, duration: Double) {
-    try await NarrationEngine.speak(text)
+    if busy {
+      await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+        waiters.append(continuation)
+      }
+    }
+    busy = true
+    do {
+      let spoken = try await NarrationEngine.speak(text)
+      release()
+      return spoken
+    } catch {
+      release()
+      throw error
+    }
+  }
+
+  private func release() {
+    busy = false
+    if waiters.isEmpty {
+      return
+    }
+    waiters.removeFirst().resume()
   }
 }
 
@@ -101,13 +124,20 @@ private final class NarrationWriter: NSObject {
       return
     }
     if pcm.frameLength == 0 {
-      completeLocked()
+      if frames > 0 {
+        completeLocked()
+      }
       return
     }
     do {
       if file == nil {
         sampleRate = pcm.format.sampleRate > 0 ? pcm.format.sampleRate : 22050
-        file = try AVAudioFile(forWriting: output, settings: pcm.format.settings)
+        file = try AVAudioFile(
+          forWriting: output,
+          settings: pcm.format.settings,
+          commonFormat: pcm.format.commonFormat,
+          interleaved: pcm.format.isInterleaved
+        )
       }
       try file?.write(from: pcm)
       frames += AVAudioFramePosition(pcm.frameLength)

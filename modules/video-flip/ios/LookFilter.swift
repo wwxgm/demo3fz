@@ -2,12 +2,30 @@ import AVFoundation
 import CoreImage
 
 enum LookFilter {
-  private static let context = CIContext()
+  private static let context: CIContext = {
+    let space = CGColorSpace(name: CGColorSpace.itur_709) ?? CGColorSpaceCreateDeviceRGB()
+    return CIContext(options: [
+      .workingColorSpace: space,
+      .outputColorSpace: space,
+      .cacheIntermediates: false,
+    ])
+  }()
 
   static func composition(asset: AVAsset, name: String) -> AVVideoComposition {
     AVVideoComposition(asset: asset, applyingCIFiltersWithHandler: { request in
-      let source = request.sourceImage
-      let output = filtered(source, name: name).cropped(to: source.extent)
+      let extent = request.sourceImage.extent
+      guard extent.isInfinite == false, extent.isEmpty == false, extent.width >= 2, extent.height >= 2 else {
+        request.finish(with: request.sourceImage, context: context)
+        return
+      }
+      let finite = CGRect(
+        x: extent.origin.x,
+        y: extent.origin.y,
+        width: floor(extent.width),
+        height: floor(extent.height)
+      )
+      let source = request.sourceImage.cropped(to: finite)
+      let output = filtered(source, name: name).cropped(to: finite)
       request.finish(with: output, context: context)
     })
   }

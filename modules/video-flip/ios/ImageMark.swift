@@ -97,6 +97,7 @@ enum WatermarkBurner {
     guard mark != nil || !line.isEmpty else {
       return
     }
+    let safeDuration = duration.isFinite && duration > 0.2 ? duration : 1
 
     let parent = CALayer()
     let videoLayer = CALayer()
@@ -119,7 +120,7 @@ enum WatermarkBurner {
         center: place(preferred, textSize: textSize, canvas: renderSize),
         canvas: renderSize,
         phase: 0.4,
-        duration: duration
+        duration: safeDuration
       ))
     }
     if mark.placeCenter {
@@ -131,12 +132,12 @@ enum WatermarkBurner {
         center: place(preferred, textSize: textSize, canvas: renderSize),
         canvas: renderSize,
         phase: 1.7,
-        duration: duration
+        duration: safeDuration
       ))
       }
     }
     if !line.isEmpty {
-      parent.addSublayer(subtitleLayer(text: line, canvas: renderSize, duration: duration, speechDuration: speechDuration))
+      parent.addSublayer(subtitleLayer(text: line, canvas: renderSize, duration: safeDuration, speechDuration: speechDuration))
     }
 
     composition.animationTool = AVVideoCompositionCoreAnimationTool(postProcessingAsVideoLayer: videoLayer, in: parent)
@@ -164,7 +165,9 @@ enum WatermarkBurner {
     let textLayer = CATextLayer()
     textLayer.frame = container.bounds.insetBy(dx: 8, dy: 6)
     textLayer.string = text
-    textLayer.font = CGFont(font.fontName as CFString)
+    if let cgFont = CGFont(font.fontName as CFString) {
+      textLayer.font = cgFont
+    }
     textLayer.fontSize = fontSize
     textLayer.foregroundColor = UIColor.white.cgColor
     textLayer.alignmentMode = .center
@@ -207,7 +210,9 @@ enum WatermarkBurner {
     let layer = CATextLayer()
     let uiFont = UIFont(name: "PingFangSC-Regular", size: fontSize) ?? UIFont.systemFont(ofSize: fontSize)
     layer.string = mark.text
-    layer.font = CGFont(uiFont.fontName as CFString)
+    if let cgFont = CGFont(uiFont.fontName as CFString) {
+      layer.font = cgFont
+    }
     layer.fontSize = fontSize
     layer.foregroundColor = UIColor.white.cgColor
     layer.alignmentMode = .center
@@ -500,7 +505,12 @@ enum ImageMark {
     var urls: [String] = []
     for _ in 0..<total {
       let seconds = Double.random(in: 0.05...(max(duration - 0.05, 0.06)))
-      let image = try generator.copyCGImage(at: CMTime(seconds: seconds, preferredTimescale: 600), actualTime: nil)
+      let image: CGImage
+      do {
+        image = try generator.copyCGImage(at: CMTime(seconds: seconds, preferredTimescale: 600), actualTime: nil)
+      } catch {
+        continue
+      }
       guard let data = UIImage(cgImage: image).jpegData(compressionQuality: 0.9) else {
         continue
       }

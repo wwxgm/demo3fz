@@ -70,8 +70,11 @@ enum ClipTimeline {
       )
     }
 
-    let insertAt = min(extend.end, duration)
+    let end = min(extend.end, duration)
+    let start = extend.start
+    let insertAt = min(end, duration)
     var cursor = CMTime.zero
+    let media = CMTimeRange(start: sourceStart, duration: sourceDuration)
 
     if insertAt > 0.05 {
       cursor = try append(
@@ -80,6 +83,7 @@ enum ClipTimeline {
         compositionVideo: compositionVideo,
         compositionAudio: compositionAudio,
         audioSpan: audioSpan,
+        media: media,
         sourceStart: sourceTime(0, base: sourceStart),
         length: seconds(insertAt),
         at: cursor,
@@ -87,29 +91,31 @@ enum ClipTimeline {
       )
     }
 
-    let oneFrame = CMTime(value: 1, timescale: 30)
+    let oneFrame = CMTime(value: 20, timescale: 600)
     var freezeStart = CMTimeSubtract(sourceTime(insertAt, base: sourceStart), oneFrame)
-    if CMTimeCompare(freezeStart, sourceStart) < 0 {
-      freezeStart = sourceStart
+    if CMTimeCompare(freezeStart, media.start) < 0 {
+      freezeStart = media.start
+    }
+    guard let freezePiece = fit(freezeStart, oneFrame, media: media) else {
+      throw ClipTimelineError.message("无法截取定格画面")
     }
     let freezeAt = cursor
-    try compositionVideo.insertTimeRange(CMTimeRange(start: freezeStart, duration: oneFrame), of: video, at: freezeAt)
-    let freezeDuration = seconds(extend.freeze)
-    compositionVideo.scaleTimeRange(CMTimeRange(start: freezeAt, duration: oneFrame), toDuration: freezeDuration)
-    cursor = CMTimeAdd(freezeAt, freezeDuration)
+    try compositionVideo.insertTimeRange(freezePiece, of: video, at: freezeAt)
+    let freezeTarget = CMTimeRange(start: freezeAt, duration: freezePiece.duration)
+    compositionVideo.scaleTimeRange(freezeTarget, toDuration: seconds(extend.freeze))
+    cursor = CMTimeAdd(freezeAt, seconds(extend.freeze))
 
     let replayAt = cursor
-    let replayLength = seconds(extend.end - extend.start)
-    try compositionVideo.insertTimeRange(
-      CMTimeRange(start: sourceTime(extend.start, base: sourceStart), duration: replayLength),
-      of: video,
-      at: replayAt
-    )
+    guard let replayPiece = fit(sourceTime(start, base: sourceStart), seconds(end - start), media: media) else {
+      throw ClipTimelineError.message("无法插入延长片段")
+    }
+    try compositionVideo.insertTimeRange(replayPiece, of: video, at: replayAt)
     var replayRange: CMTimeRange?
     let slow = extend.mode == "slow" || extend.mode == "slowZoom"
+    let replayTarget = CMTimeRange(start: replayAt, duration: replayPiece.duration)
     if slow {
-      let slowed = CMTimeMultiplyByFloat64(replayLength, multiplier: 2)
-      compositionVideo.scaleTimeRange(CMTimeRange(start: replayAt, duration: replayLength), toDuration: slowed)
+      let slowed = CMTimeMultiplyByFloat64(replayPiece.duration, multiplier: 2)
+      compositionVideo.scaleTimeRange(replayTarget, toDuration: slowed)
       cursor = CMTimeAdd(replayAt, slowed)
       if extend.mode == "slowZoom" {
         replayRange = CMTimeRange(start: replayAt, duration: slowed)
@@ -120,15 +126,15 @@ enum ClipTimeline {
           audio,
           compositionAudio: compositionAudio,
           audioSpan: audioSpan,
-          sourceStart: sourceTime(extend.start, base: sourceStart),
-          length: replayLength,
+          sourceStart: replayPiece.start,
+          length: replayPiece.duration,
           at: replayAt
         )
       }
-      cursor = CMTimeAdd(replayAt, replayLength)
+      cursor = CMTimeAdd(replayTarget.start, replayTarget.duration)
     }
 
-    let rest = duration - insertAt
+    let rest = duration - end
     if rest > 0.05 {
       cursor = try append(
         video: video,
@@ -136,7 +142,8 @@ enum ClipTimeline {
         compositionVideo: compositionVideo,
         compositionAudio: compositionAudio,
         audioSpan: audioSpan,
-        sourceStart: sourceTime(insertAt, base: sourceStart),
+        media: media,
+        sourceStart: sourceTime(end, base: sourceStart),
         length: seconds(rest),
         at: cursor,
         includeAudio: true
@@ -158,23 +165,35 @@ enum ClipTimeline {
     compositionVideo: AVMutableCompositionTrack,
     compositionAudio: AVMutableCompositionTrack?,
     audioSpan: CMTimeRange?,
+    media: CMTimeRange,
     sourceStart: CMTime,
     length: CMTime,
     at cursor: CMTime,
     includeAudio: Bool
   ) throws -> CMTime {
-    try compositionVideo.insertTimeRange(CMTimeRange(start: sourceStart, duration: length), of: video, at: cursor)
+    guard let piece = fit(sourceStart, length, media: media) else {
+      return cursor
+    }
+    try compositionVideo.insertTimeRange(piece, of: video, at: cursor)
     if includeAudio, let audio, let compositionAudio {
       insertAudio(
         audio,
         compositionAudio: compositionAudio,
         audioSpan: audioSpan,
-        sourceStart: sourceStart,
-        length: length,
+        sourceStart: piece.start,
+        length: piece.duration,
         at: cursor
       )
     }
-    return CMTimeAdd(cursor, length)
+    return CMTimeAdd(cursor, piece.duration)
+  }
+
+  private static func fit(_ start: CMTime, _ length: CMTime, media: CMTimeRange) -> CMTimeRange? {
+    let piece = CMTimeRange(start: start, duration: length).intersection(media)
+    guard piece.isValid, piece.duration.isValid, piece.duration.seconds > 0.001 else {
+      return nil
+    }
+    return piece
   }
 
   private static func insertAudio(

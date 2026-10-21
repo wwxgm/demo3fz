@@ -46,6 +46,7 @@ type VideoFlipNative = {
   joinVideos(uris: string[]): Promise<string>;
   makePoster(script: string, backgroundUri: string): Promise<string>;
   removeTempFile(uri: string): void;
+  clearProcessingCache(): number;
 };
 
 const missingMessage = '当前安装包没有处理模块，请重新打包 IPA 后再使用';
@@ -67,6 +68,9 @@ const missing: VideoFlipNative = {
     throw new Error(missingMessage);
   },
   removeTempFile() {},
+  clearProcessingCache() {
+    return 0;
+  },
 };
 
 function loadNative(): VideoFlipNative {

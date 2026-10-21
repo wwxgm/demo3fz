@@ -28,6 +28,10 @@ public class VideoFlipModule: Module {
     Function("removeTempFile") { (uri: String) in
       VideoFlipper.removeTempFile(uri: uri)
     }
+
+    Function("clearProcessingCache") { () -> Double in
+      VideoFlipper.clearProcessingCache()
+    }
   }
 }
 
@@ -49,6 +53,12 @@ private enum VideoFlipError: LocalizedError {
       return message
     }
   }
+}
+
+func applyRec709(_ composition: AVMutableVideoComposition) {
+  composition.colorPrimaries = AVVideoColorPrimaries_ITU_R_709_2
+  composition.colorTransferFunction = AVVideoTransferFunction_ITU_R_709_2
+  composition.colorYCbCrMatrix = AVVideoYCbCrMatrix_ITU_R_709_2
 }
 
 private enum VideoFlipper {
@@ -158,7 +168,6 @@ private enum VideoFlipper {
     videoComposition.instructions = [instruction]
     videoComposition.renderSize = renderSize
     videoComposition.frameDuration = CMTime(value: 1, timescale: CMTimeScale(Int(fps.rounded())))
-    videoComposition.sourceTrackIDForFrameTiming = compositionVideoTrack.trackID
     let filterName = Self.filterName(from: options)
     let overlay = Self.needsOverlay(options: options, subtitle: subtitle)
     if filterName.isEmpty {
@@ -171,53 +180,26 @@ private enum VideoFlipper {
         speechDuration: speechDuration
       )
     }
+    // 水印和字幕会挂上动画层。这时再指定帧时间轨道，导出会直接失败。
+    // 纯翻转不改色彩，避免影响已经可用的镜像导出。
+    if videoComposition.animationTool == nil {
+      videoComposition.sourceTrackIDForFrameTiming = compositionVideoTrack.trackID
+    } else {
+      applyRec709(videoComposition)
+    }
 
     let outputURL = FileManager.default.temporaryDirectory
       .appendingPathComponent("flipped-\(UUID().uuidString).mp4")
-    if FileManager.default.fileExists(atPath: outputURL.path) {
-      try FileManager.default.removeItem(at: outputURL)
-    }
-
-    let compatible = AVAssetExportSession.exportPresets(compatibleWith: asset)
-    let preferredPresets = [
-      AVAssetExportPresetHighestQuality,
-      AVAssetExportPreset1920x1080,
-      AVAssetExportPreset1280x720,
-      AVAssetExportPresetMediumQuality,
-    ]
-    let preset = preferredPresets.first(where: { compatible.contains($0) }) ?? AVAssetExportPresetHighestQuality
-
-    guard let exportSession = AVAssetExportSession(asset: composition, presetName: preset) else {
-      throw VideoFlipError.exporterUnavailable
-    }
-
-    exportSession.outputURL = outputURL
-    exportSession.outputFileType = .mp4
-    exportSession.videoComposition = videoComposition
-    exportSession.audioMix = audioMix(
-      original: originalAudioTrack,
-      speech: speechTrack,
-      speechDuration: speechDuration
+    try await exportVideo(
+      composition: composition,
+      videoComposition: videoComposition,
+      audioMix: audioMix(
+        original: originalAudioTrack,
+        speech: speechTrack,
+        speechDuration: speechDuration
+      ),
+      outputURL: outputURL
     )
-    exportSession.shouldOptimizeForNetworkUse = true
-
-    try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
-      exportSession.exportAsynchronously {
-        switch exportSession.status {
-        case .completed:
-          continuation.resume()
-        case .cancelled:
-          continuation.resume(throwing: VideoFlipError.exportFailed("翻转已取消"))
-        default:
-          let reason = exportSession.error?.localizedDescription ?? "导出失败"
-          continuation.resume(throwing: VideoFlipError.exportFailed(reason))
-        }
-      }
-    }
-
-    guard FileManager.default.fileExists(atPath: outputURL.path) else {
-      throw VideoFlipError.exportFailed("翻转完成但没有生成文件")
-    }
 
     guard !filterName.isEmpty else {
       return outputURL.absoluteString
@@ -315,7 +297,6 @@ private enum VideoFlipper {
     }
     let videoComposition = LookFilter.composition(asset: composition, name: name)
     try await exportVideo(
-      asset: asset,
       composition: composition,
       videoComposition: videoComposition,
       audioMix: nil,
@@ -354,7 +335,7 @@ private enum VideoFlipper {
     let naturalSize = try await videoTrack.load(.naturalSize)
     let preferred = try await videoTrack.load(.preferredTransform)
     let fitted = CGRect(origin: .zero, size: naturalSize).applying(preferred)
-    let renderSize = CGSize(width: abs(fitted.width), height: abs(fitted.height))
+    let renderSize = CGSize(width: evenPixel(abs(fitted.width)), height: evenPixel(abs(fitted.height)))
     let instruction = AVMutableVideoCompositionInstruction()
     instruction.timeRange = CMTimeRange(start: .zero, duration: range.duration)
     let layerInstruction = AVMutableVideoCompositionLayerInstruction(assetTrack: compositionVideo)
@@ -372,8 +353,8 @@ private enum VideoFlipper {
       subtitle: subtitle,
       speechDuration: speechDuration
     )
+    applyRec709(videoComposition)
     try await exportVideo(
-      asset: asset,
       composition: composition,
       videoComposition: videoComposition,
       audioMix: nil,
@@ -382,47 +363,72 @@ private enum VideoFlipper {
   }
 
   private static func exportVideo(
-    asset: AVAsset,
     composition: AVMutableComposition,
     videoComposition: AVVideoComposition,
     audioMix: AVMutableAudioMix?,
     outputURL: URL
   ) async throws {
     if FileManager.default.fileExists(atPath: outputURL.path) {
-      try FileManager.default.removeItem(at: outputURL)
+      try? FileManager.default.removeItem(at: outputURL)
     }
-    let compatible = AVAssetExportSession.exportPresets(compatibleWith: asset)
+    let compatible = AVAssetExportSession.exportPresets(compatibleWith: composition)
     let preferredPresets = [
       AVAssetExportPresetHighestQuality,
       AVAssetExportPreset1920x1080,
       AVAssetExportPreset1280x720,
       AVAssetExportPresetMediumQuality,
     ]
-    let preset = preferredPresets.first(where: { compatible.contains($0) }) ?? AVAssetExportPresetHighestQuality
-    guard let exportSession = AVAssetExportSession(asset: composition, presetName: preset) else {
-      throw VideoFlipError.exporterUnavailable
+    var presets = preferredPresets.filter { compatible.contains($0) }
+    if presets.isEmpty {
+      presets = preferredPresets
     }
-    exportSession.outputURL = outputURL
-    exportSession.outputFileType = .mp4
-    exportSession.videoComposition = videoComposition
-    exportSession.audioMix = audioMix
-    exportSession.shouldOptimizeForNetworkUse = true
-    try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
-      exportSession.exportAsynchronously {
-        switch exportSession.status {
-        case .completed:
-          continuation.resume()
-        case .cancelled:
-          continuation.resume(throwing: VideoFlipError.exportFailed("翻转已取消"))
-        default:
-          let reason = exportSession.error?.localizedDescription ?? "导出失败"
-          continuation.resume(throwing: VideoFlipError.exportFailed(reason))
+    var last = "导出失败"
+    for preset in presets {
+      if FileManager.default.fileExists(atPath: outputURL.path) {
+        try? FileManager.default.removeItem(at: outputURL)
+      }
+      guard let exportSession = AVAssetExportSession(asset: composition, presetName: preset) else {
+        last = "系统无法导出这个视频"
+        continue
+      }
+      exportSession.outputURL = outputURL
+      exportSession.outputFileType = .mp4
+      exportSession.videoComposition = videoComposition
+      exportSession.audioMix = audioMix
+      exportSession.shouldOptimizeForNetworkUse = true
+      let failure: String? = await withCheckedContinuation { continuation in
+        exportSession.exportAsynchronously {
+          switch exportSession.status {
+          case .completed:
+            continuation.resume(returning: nil)
+          case .cancelled:
+            continuation.resume(returning: "翻转已取消")
+          default:
+            continuation.resume(returning: exportMessage(exportSession.error))
+          }
         }
       }
+      if failure == nil, FileManager.default.fileExists(atPath: outputURL.path) {
+        return
+      }
+      if failure == "翻转已取消" {
+        throw VideoFlipError.exportFailed("翻转已取消")
+      }
+      last = failure ?? "翻转完成但没有生成文件"
+      try? FileManager.default.removeItem(at: outputURL)
     }
-    guard FileManager.default.fileExists(atPath: outputURL.path) else {
-      throw VideoFlipError.exportFailed("翻转完成但没有生成文件")
+    throw VideoFlipError.exportFailed(last)
+  }
+
+  private static func exportMessage(_ error: Error?) -> String {
+    guard let error else {
+      return "导出失败"
     }
+    let ns = error as NSError
+    if ns.domain == AVFoundationErrorDomain {
+      return "\(error.localizedDescription)（\(ns.code)）"
+    }
+    return error.localizedDescription
   }
 
   private static func parseExtend(_ options: [String: Any]) -> ClipExtend? {
@@ -483,6 +489,62 @@ private enum VideoFlipper {
       return
     }
     try? FileManager.default.removeItem(at: url)
+  }
+
+  static func clearProcessingCache() -> Double {
+    let prefixes = ["flipped-", "joined-", "poster-", "frame-", "marked-", "narration-"]
+    let extensions: Set<String> = ["mp4", "mov", "m4v", "jpg", "jpeg", "png", "heic", "caf", "m4a"]
+    let fileManager = FileManager.default
+    var roots = [fileManager.temporaryDirectory]
+    if let caches = fileManager.urls(for: .cachesDirectory, in: .userDomainMask).first {
+      roots.append(caches)
+    }
+    var freed: Int64 = 0
+    for root in roots {
+      freed += sweepCache(root, prefixes: prefixes, extensions: extensions, depth: 0)
+    }
+    URLCache.shared.removeAllCachedResponses()
+    return Double(freed)
+  }
+
+  private static func sweepCache(
+    _ url: URL,
+    prefixes: [String],
+    extensions: Set<String>,
+    depth: Int
+  ) -> Int64 {
+    if depth > 6 {
+      return 0
+    }
+    let fileManager = FileManager.default
+    var isDirectory: ObjCBool = false
+    guard fileManager.fileExists(atPath: url.path, isDirectory: &isDirectory) else {
+      return 0
+    }
+    if !isDirectory.boolValue {
+      let name = url.lastPathComponent
+      let matched = prefixes.contains(where: { name.hasPrefix($0) }) || extensions.contains(url.pathExtension.lowercased())
+      guard matched else {
+        return 0
+      }
+      let size = (try? fileManager.attributesOfItem(atPath: url.path)[.size] as? NSNumber)?.int64Value ?? 0
+      do {
+        try fileManager.removeItem(at: url)
+        return size
+      } catch {
+        return 0
+      }
+    }
+    let children = (try? fileManager.contentsOfDirectory(
+      at: url,
+      includingPropertiesForKeys: nil,
+      options: [.skipsHiddenFiles]
+    )) ?? []
+    var freed: Int64 = 0
+    for child in children {
+      freed += sweepCache(child, prefixes: prefixes, extensions: extensions, depth: depth + 1)
+    }
+    return freed
   }
 
   private static func subtitle(from options: [String: Any]) -> String {
