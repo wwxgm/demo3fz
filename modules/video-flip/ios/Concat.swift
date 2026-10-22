@@ -62,9 +62,10 @@ enum Concat {
 
     let layer = AVMutableVideoCompositionLayerInstruction(assetTrack: videoTrack)
     var cursor = CMTime.zero
+    var placed: [(CMTime, CGAffineTransform)] = []
     for piece in pieces {
       try videoTrack.insertTimeRange(piece.range, of: piece.video, at: cursor)
-      layer.setTransform(fit(piece: piece, canvas: canvas), at: cursor)
+      placed.append((cursor, fit(piece: piece, canvas: canvas)))
       if let sourceAudio = piece.audio, let audioTrack {
         let audioRange = try await sourceAudio.load(.timeRange)
         let overlap = CMTimeRange(start: piece.range.start, duration: piece.range.duration).intersection(audioRange)
@@ -76,8 +77,27 @@ enum Concat {
       cursor = CMTimeAdd(cursor, piece.range.duration)
     }
 
+    let frames = max(Int(floor(cursor.seconds * 30.0)), 1)
+    let aligned = CMTime(value: CMTimeValue(frames), timescale: 30)
+    if CMTimeCompare(cursor, aligned) > 0 {
+      videoTrack.removeTimeRange(CMTimeRange(start: aligned, duration: CMTimeSubtract(cursor, aligned)))
+      if let audioTrack {
+        let audioRange = try await audioTrack.load(.timeRange)
+        let audioEnd = CMTimeAdd(audioRange.start, audioRange.duration)
+        if CMTimeCompare(audioEnd, aligned) > 0 {
+          let start = CMTimeMaximum(aligned, audioRange.start)
+          if CMTimeCompare(audioEnd, start) > 0 {
+            audioTrack.removeTimeRange(CMTimeRange(start: start, duration: CMTimeSubtract(audioEnd, start)))
+          }
+        }
+      }
+    }
+
+    for item in placed where CMTimeCompare(item.0, aligned) < 0 {
+      layer.setTransform(item.1, at: item.0)
+    }
     let instruction = AVMutableVideoCompositionInstruction()
-    instruction.timeRange = CMTimeRange(start: .zero, duration: cursor)
+    instruction.timeRange = CMTimeRange(start: .zero, duration: aligned)
     instruction.backgroundColor = UIColor.black.cgColor
     instruction.layerInstructions = [layer]
 
@@ -85,7 +105,6 @@ enum Concat {
     videoComposition.instructions = [instruction]
     videoComposition.renderSize = canvas
     videoComposition.frameDuration = CMTime(value: 1, timescale: 30)
-    applyRec709(videoComposition)
 
     let output = FileManager.default.temporaryDirectory.appendingPathComponent("joined-\(UUID().uuidString).mp4")
     try await export(composition: composition, videoComposition: videoComposition, output: output)
@@ -156,29 +175,45 @@ enum Concat {
       AVAssetExportPreset1280x720,
       AVAssetExportPresetMediumQuality,
     ]
-    let preset = preferred.first(where: { compatible.contains($0) }) ?? AVAssetExportPresetHighestQuality
-    guard let session = AVAssetExportSession(asset: composition, presetName: preset) else {
-      throw ConcatError.message("系统无法导出合并后的视频")
+    var presets = preferred.filter { compatible.contains($0) }
+    if presets.isEmpty {
+      presets = preferred
     }
-    session.outputURL = output
-    session.outputFileType = .mp4
-    session.videoComposition = videoComposition
-    session.shouldOptimizeForNetworkUse = true
-    try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
-      session.exportAsynchronously {
-        switch session.status {
-        case .completed:
-          continuation.resume()
-        case .cancelled:
-          continuation.resume(throwing: ConcatError.message("合并已取消"))
-        default:
-          continuation.resume(throwing: ConcatError.message(session.error?.localizedDescription ?? "合并失败"))
+    var last = "合并失败"
+    for preset in presets {
+      if FileManager.default.fileExists(atPath: output.path) {
+        try? FileManager.default.removeItem(at: output)
+      }
+      guard let session = AVAssetExportSession(asset: composition, presetName: preset) else {
+        last = "系统无法导出合并后的视频"
+        continue
+      }
+      session.outputURL = output
+      session.outputFileType = .mp4
+      session.videoComposition = videoComposition
+      session.shouldOptimizeForNetworkUse = false
+      let failure: String? = await withCheckedContinuation { continuation in
+        session.exportAsynchronously {
+          switch session.status {
+          case .completed:
+            continuation.resume(returning: nil)
+          case .cancelled:
+            continuation.resume(returning: "合并已取消")
+          default:
+            continuation.resume(returning: session.error?.localizedDescription ?? "合并失败")
+          }
         }
       }
+      if failure == nil, FileManager.default.fileExists(atPath: output.path) {
+        return
+      }
+      if failure == "合并已取消" {
+        throw ConcatError.message("合并已取消")
+      }
+      last = failure ?? "合并完成但没有生成文件"
+      try? FileManager.default.removeItem(at: output)
     }
-    guard FileManager.default.fileExists(atPath: output.path) else {
-      throw ConcatError.message("合并完成但没有生成文件")
-    }
+    throw ConcatError.message(last)
   }
 
   private static func resolve(_ uri: String) throws -> URL {

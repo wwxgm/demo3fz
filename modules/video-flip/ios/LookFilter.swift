@@ -14,18 +14,12 @@ enum LookFilter {
   static func composition(asset: AVAsset, name: String) -> AVVideoComposition {
     AVVideoComposition(asset: asset, applyingCIFiltersWithHandler: { request in
       let extent = request.sourceImage.extent
-      guard extent.isInfinite == false, extent.isEmpty == false, extent.width >= 2, extent.height >= 2 else {
+      guard extent.isInfinite == false, extent.isNull == false, extent.isEmpty == false,
+            extent.width >= 2, extent.height >= 2 else {
         request.finish(with: request.sourceImage, context: context)
         return
       }
-      let finite = CGRect(
-        x: extent.origin.x,
-        y: extent.origin.y,
-        width: floor(extent.width),
-        height: floor(extent.height)
-      )
-      let source = request.sourceImage.cropped(to: finite)
-      let output = filtered(source, name: name).cropped(to: finite)
+      let output = filtered(request.sourceImage, name: name).cropped(to: extent)
       request.finish(with: output, context: context)
     })
   }

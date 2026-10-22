@@ -69,13 +69,6 @@ const ENGINES: Array<{ id: Engine; label: string }> = [
   { id: 'sogou', label: '搜狗图片' },
 ];
 
-const BROWSER_HEADERS = {
-  Accept: 'application/json,text/plain,text/html,*/*',
-  'Accept-Language': 'zh-CN,zh;q=0.9',
-  'User-Agent':
-    'Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Mobile/15E148 Safari/604.1',
-};
-
 function decodeText(value: string) {
   return value
     .replace(/&quot;/g, '"')
@@ -102,15 +95,22 @@ function asNumber(value: unknown) {
 }
 
 async function readSite(url: string, referer: string) {
-  let response: Response;
+  let text: string;
   try {
-    response = await fetch(url, { headers: { ...BROWSER_HEADERS, Referer: referer } });
+    text = await VideoFlip.loadPage(url, referer);
   } catch (error) {
     throw new Error(`没有连上接口\n${url}\n${errorText(error)}`);
   }
-  const text = await response.text();
-  if (!response.ok) {
-    throw new Error(`接口返回 HTTP ${response.status}\n${url}\n${text.slice(0, 500)}`);
+  if (text.includes('Forbid spider')) {
+    try {
+      await VideoFlip.loadPage('https://image.baidu.com/', 'https://www.baidu.com/');
+      text = await VideoFlip.loadPage(url, referer);
+    } catch (error) {
+      throw new Error(`没有连上接口\n${url}\n${errorText(error)}`);
+    }
+  }
+  if (text.includes('Forbid spider')) {
+    throw new Error(`百度把这次搜索拦下了，请改用必应或搜狗。\n${url}\n${text.slice(0, 300)}`);
   }
   return text;
 }
@@ -377,7 +377,7 @@ export function SearchScreen() {
         const result = await DocumentPicker.getDocumentAsync({
           type: ['image/*', 'public.image'],
           multiple: true,
-          copyToCacheDirectory: true,
+          copyToCacheDirectory: false,
         });
         if (result.canceled) return;
         result.assets.forEach((asset, index) => {

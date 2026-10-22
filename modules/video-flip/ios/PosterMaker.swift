@@ -13,7 +13,7 @@ enum PosterError: LocalizedError {
 }
 
 enum PosterMaker {
-  static func make(script: String, backgroundUri: String) async throws -> String {
+  static func make(script: String, backgroundUri: String, options: [String: Any] = [:]) async throws -> String {
     let cards = storyCards(from: script)
     let ranked = cards.contains(where: { $0.rank })
     let rows = ranked ? [] : lines(from: script)
@@ -35,6 +35,23 @@ enum PosterMaker {
     }
 
     let trimmedBackground = backgroundUri.trimmingCharacters(in: .whitespacesAndNewlines)
+    let fill = Self.flag(options, key: "fill", default: true)
+    let mute = Self.flag(options, key: "mute", default: true)
+    let wantedSeconds = Self.scriptSeconds(
+      ranked: ranked,
+      rankCount: cards.filter { $0.rank }.count,
+      lineCount: rows.count
+    )
+    if let clips = Self.clipList(options: options), !clips.isEmpty {
+      return try await makeSequence(
+        cards: cards,
+        ranked: ranked,
+        rows: rows,
+        clips: clips,
+        mute: mute,
+        wantedSeconds: wantedSeconds
+      )
+    }
     var accessed: URL?
     var baseFile: URL?
     defer {
@@ -49,16 +66,13 @@ enum PosterMaker {
     let transform: CGAffineTransform
     let timeline: CMTime
     if trimmedBackground.isEmpty {
-      let seconds = ranked
-        ? 1.2 + Double(max(cards.filter { $0.rank }.count, 1)) * 3.4
-        : timing(lineCount: rows.count, limit: nil).total
       let size = CGSize(width: 1080, height: 1920)
-      let url = try await writeBlack(size: size, seconds: seconds)
+      let url = try await writeBlack(size: size, seconds: wantedSeconds)
       baseFile = url
       source = AVURLAsset(url: url)
       renderSize = size
       transform = .identity
-      timeline = CMTime(seconds: seconds, preferredTimescale: 600)
+      timeline = CMTime(seconds: wantedSeconds, preferredTimescale: 600)
     } else {
       let url = try resolve(trimmedBackground)
       if url.startAccessingSecurityScopedResource() {
@@ -85,7 +99,7 @@ enum PosterMaker {
       if range.duration.seconds > 120 {
         throw PosterError.message("背景视频请控制在 2 分钟以内")
       }
-      timeline = range.duration
+      timeline = fill ? CMTime(seconds: wantedSeconds, preferredTimescale: 600) : range.duration
     }
 
     guard let videoTrack = try await source.loadTracks(withMediaType: .video).first else {
@@ -99,41 +113,484 @@ enum PosterMaker {
     ) else {
       throw PosterError.message("系统无法制作视频")
     }
-    let insert = CMTimeRange(start: sourceRange.start, duration: minTime(sourceRange.duration, timeline))
-    try compositionVideo.insertTimeRange(insert, of: videoTrack, at: .zero)
+    let rawDuration = minTime(sourceRange.duration, timeline)
+    let stretch = fill && !trimmedBackground.isEmpty && sourceRange.duration.seconds + 0.08 < wantedSeconds
+    var compositionAudio: AVMutableCompositionTrack?
+    if stretch {
+      compositionAudio = try await cover(
+        video: videoTrack,
+        audio: mute ? nil : try await source.loadTracks(withMediaType: .audio).first,
+        sourceRange: sourceRange,
+        target: timeline,
+        composition: composition,
+        compositionVideo: compositionVideo
+      )
+    } else {
+      let insert = CMTimeRange(start: sourceRange.start, duration: rawDuration)
+      try compositionVideo.insertTimeRange(insert, of: videoTrack, at: .zero)
+      if !mute, let audio = try await source.loadTracks(withMediaType: .audio).first,
+         let track = composition.addMutableTrack(
+          withMediaType: .audio,
+          preferredTrackID: kCMPersistentTrackID_Invalid
+         ) {
+        let audioRange = try await audio.load(.timeRange)
+        let overlap = insert.intersection(audioRange)
+        if overlap.duration.isValid, overlap.duration.seconds > 0.02 {
+          try? track.insertTimeRange(overlap, of: audio, at: .zero)
+          compositionAudio = track
+        }
+      }
+    }
     compositionVideo.preferredTransform = .identity
-    if let audio = try await source.loadTracks(withMediaType: .audio).first,
-       let compositionAudio = composition.addMutableTrack(
-        withMediaType: .audio,
-        preferredTrackID: kCMPersistentTrackID_Invalid
-       ) {
-      let audioRange = try await audio.load(.timeRange)
-      let overlap = insert.intersection(audioRange)
-      if overlap.duration.isValid, overlap.duration.seconds > 0.02 {
-        try? compositionAudio.insertTimeRange(overlap, of: audio, at: .zero)
+
+    let composed = try await compositionVideo.load(.timeRange)
+    let limit = minTime(composed.duration, timeline)
+    let frames = max(Int(floor(limit.seconds * 30.0)), 1)
+    let aligned = CMTime(value: CMTimeValue(frames), timescale: 30)
+    if CMTimeCompare(CMTimeAdd(composed.start, composed.duration), aligned) > 0 {
+      compositionVideo.removeTimeRange(
+        CMTimeRange(start: aligned, duration: CMTimeSubtract(CMTimeAdd(composed.start, composed.duration), aligned))
+      )
+      if let compositionAudio {
+        let audioRange = try await compositionAudio.load(.timeRange)
+        let audioEnd = CMTimeAdd(audioRange.start, audioRange.duration)
+        if CMTimeCompare(audioEnd, aligned) > 0 {
+          let start = CMTimeMaximum(aligned, audioRange.start)
+          if CMTimeCompare(audioEnd, start) > 0 {
+            compositionAudio.removeTimeRange(CMTimeRange(start: start, duration: CMTimeSubtract(audioEnd, start)))
+          }
+        }
       }
     }
 
     let instruction = AVMutableVideoCompositionInstruction()
-    instruction.timeRange = CMTimeRange(start: .zero, duration: insert.duration)
+    instruction.timeRange = CMTimeRange(start: .zero, duration: aligned)
     let layerInstruction = AVMutableVideoCompositionLayerInstruction(assetTrack: compositionVideo)
-    layerInstruction.setTransform(transform, at: .zero)
+    let posterFrame = CMTime(value: 1, timescale: 30)
+    if stretch, aligned.seconds > 0.4, CMTimeCompare(aligned, posterFrame) > 0 {
+      layerInstruction.setTransformRamp(
+        fromStart: transform,
+        toEnd: zoomAround(transform, renderSize: renderSize, scale: 1.18),
+        timeRange: CMTimeRange(start: .zero, duration: CMTimeSubtract(aligned, posterFrame))
+      )
+    } else {
+      layerInstruction.setTransform(transform, at: .zero)
+    }
     instruction.layerInstructions = [layerInstruction]
 
     let videoComposition = AVMutableVideoComposition()
     videoComposition.instructions = [instruction]
     videoComposition.renderSize = renderSize
     videoComposition.frameDuration = CMTime(value: 1, timescale: 30)
-    videoComposition.sourceTrackIDForFrameTiming = compositionVideo.trackID
     if ranked {
-      burnRanking(cards, into: videoComposition, renderSize: renderSize, duration: insert.duration.seconds)
+      burnRanking(cards, into: videoComposition, renderSize: renderSize, duration: aligned.seconds)
     } else {
-      burn(rows, into: videoComposition, renderSize: renderSize, duration: insert.duration.seconds)
+      burn(rows, into: videoComposition, renderSize: renderSize, duration: aligned.seconds)
     }
 
     let output = FileManager.default.temporaryDirectory.appendingPathComponent("poster-\(UUID().uuidString).mp4")
     try await export(composition: composition, videoComposition: videoComposition, output: output)
     return output.absoluteString
+  }
+
+  private struct Clip {
+    var uri: String
+    var image: Bool
+  }
+
+  private struct Span {
+    var start: CMTime
+    var duration: CMTime
+    var transform: CGAffineTransform
+  }
+
+  private static func clipList(options: [String: Any]) -> [Clip]? {
+    guard let rows = options["backgrounds"] as? [[String: Any]], !rows.isEmpty else {
+      return nil
+    }
+    return rows.compactMap { row in
+      guard let uri = row["uri"] as? String else { return nil }
+      let trimmed = uri.trimmingCharacters(in: .whitespacesAndNewlines)
+      guard !trimmed.isEmpty else { return nil }
+      let kind = (row["kind"] as? String) ?? "video"
+      return Clip(uri: trimmed, image: kind == "image")
+    }
+  }
+
+  private static func makeSequence(
+    cards: [Card],
+    ranked: Bool,
+    rows: [String],
+    clips: [Clip],
+    mute: Bool,
+    wantedSeconds: Double
+  ) async throws -> String {
+    guard clips.count <= 12 else {
+      throw PosterError.message("背景最多 12 个")
+    }
+    let canvas = CGSize(width: 1080, height: 1920)
+    let slotSeconds = max(wantedSeconds / Double(clips.count), 1.2)
+    let slot = CMTime(seconds: slotSeconds, preferredTimescale: 600)
+    var accessed: [URL] = []
+    var temps: [URL] = []
+    defer {
+      for url in accessed {
+        url.stopAccessingSecurityScopedResource()
+      }
+      for url in temps {
+        try? FileManager.default.removeItem(at: url)
+      }
+    }
+
+    let composition = AVMutableComposition()
+    guard let compositionVideo = composition.addMutableTrack(
+      withMediaType: .video,
+      preferredTrackID: kCMPersistentTrackID_Invalid
+    ) else {
+      throw PosterError.message("系统无法制作视频")
+    }
+    compositionVideo.preferredTransform = .identity
+    var compositionAudio: AVMutableCompositionTrack?
+    var cursor = CMTime.zero
+    var spans: [Span] = []
+
+    for (index, clip) in clips.enumerated() {
+      let url = try resolve(clip.uri)
+      if url.startAccessingSecurityScopedResource() {
+        accessed.append(url)
+      }
+      guard FileManager.default.fileExists(atPath: url.path) else {
+        throw PosterError.message(clip.image ? "找不到这张背景图片" : "找不到背景视频，请重新选择")
+      }
+      if clip.image {
+        let file = try await writeKenBurns(
+          imageURL: url,
+          size: canvas,
+          seconds: slotSeconds,
+          fadeIn: index > 0,
+          fadeOut: index < clips.count - 1
+        )
+        temps.append(file)
+        let asset = AVURLAsset(url: file)
+        guard let track = try await asset.loadTracks(withMediaType: .video).first else {
+          throw PosterError.message("这张背景图片无法做成画面")
+        }
+        let range = try await track.load(.timeRange)
+        let use = minTime(range.duration, slot)
+        try compositionVideo.insertTimeRange(CMTimeRange(start: range.start, duration: use), of: track, at: cursor)
+        spans.append(Span(start: cursor, duration: use, transform: .identity))
+        cursor = CMTimeAdd(cursor, use)
+      } else {
+        let asset = AVURLAsset(url: url)
+        guard let track = try await asset.loadTracks(withMediaType: .video).first else {
+          throw PosterError.message("这个背景里没有画面")
+        }
+        let range = try await track.load(.timeRange)
+        guard range.duration.isValid, range.duration.seconds > 0.3 else {
+          throw PosterError.message("背景视频太短")
+        }
+        if range.duration.seconds > 120 {
+          throw PosterError.message("背景视频请控制在 2 分钟以内")
+        }
+        let audio = mute ? nil : try await asset.loadTracks(withMediaType: .audio).first
+        let placed = try await placeVideo(
+          track,
+          audio: audio,
+          range: range,
+          at: cursor,
+          slot: slot,
+          into: compositionVideo,
+          composition: composition,
+          compositionAudio: &compositionAudio
+        )
+        let transform = try await fillTransform(track, canvas: canvas)
+        spans.append(Span(start: cursor, duration: placed, transform: transform))
+        cursor = CMTimeAdd(cursor, placed)
+      }
+    }
+
+    let composed = try await compositionVideo.load(.timeRange)
+    let frames = max(Int(floor(composed.duration.seconds * 30.0)), 1)
+    let aligned = CMTime(value: CMTimeValue(frames), timescale: 30)
+    if CMTimeCompare(CMTimeAdd(composed.start, composed.duration), aligned) > 0 {
+      compositionVideo.removeTimeRange(
+        CMTimeRange(
+          start: aligned,
+          duration: CMTimeSubtract(CMTimeAdd(composed.start, composed.duration), aligned)
+        )
+      )
+    }
+    if let compositionAudio {
+      let audioRange = try await compositionAudio.load(.timeRange)
+      let audioEnd = CMTimeAdd(audioRange.start, audioRange.duration)
+      if CMTimeCompare(audioEnd, aligned) > 0 {
+        let start = CMTimeMaximum(aligned, audioRange.start)
+        if CMTimeCompare(audioEnd, start) > 0 {
+          compositionAudio.removeTimeRange(
+            CMTimeRange(start: start, duration: CMTimeSubtract(audioEnd, start))
+          )
+        }
+      }
+    }
+
+    let instruction = AVMutableVideoCompositionInstruction()
+    instruction.timeRange = CMTimeRange(start: .zero, duration: aligned)
+    let layerInstruction = AVMutableVideoCompositionLayerInstruction(assetTrack: compositionVideo)
+    let frame = CMTime(value: 1, timescale: 30)
+    for span in spans {
+      guard CMTimeCompare(span.start, aligned) < 0 else { continue }
+      let at = CMTimeMinimum(span.start, CMTimeSubtract(aligned, frame))
+      guard CMTimeCompare(at, aligned) < 0 else { continue }
+      layerInstruction.setTransform(span.transform, at: at)
+    }
+    instruction.layerInstructions = [layerInstruction]
+
+    let videoComposition = AVMutableVideoComposition()
+    videoComposition.instructions = [instruction]
+    videoComposition.renderSize = canvas
+    videoComposition.frameDuration = CMTime(value: 1, timescale: 30)
+    if ranked {
+      burnRanking(cards, into: videoComposition, renderSize: canvas, duration: aligned.seconds)
+    } else {
+      burn(rows, into: videoComposition, renderSize: canvas, duration: aligned.seconds)
+    }
+    let output = FileManager.default.temporaryDirectory.appendingPathComponent("poster-\(UUID().uuidString).mp4")
+    try await export(composition: composition, videoComposition: videoComposition, output: output)
+    return output.absoluteString
+  }
+
+  private static func placeVideo(
+    _ track: AVAssetTrack,
+    audio: AVAssetTrack?,
+    range: CMTimeRange,
+    at cursor: CMTime,
+    slot: CMTime,
+    into compositionVideo: AVMutableCompositionTrack,
+    composition: AVMutableComposition,
+    compositionAudio: inout AVMutableCompositionTrack?
+  ) async throws -> CMTime {
+    let audioSpan = try await audio?.load(.timeRange)
+    if audio != nil, compositionAudio == nil {
+      compositionAudio = composition.addMutableTrack(
+        withMediaType: .audio,
+        preferredTrackID: kCMPersistentTrackID_Invalid
+      )
+    }
+    let audioTarget = compositionAudio
+    func layAudio(videoRange: CMTimeRange, at atTime: CMTime, slowed: CMTime?) {
+      guard let audio, let audioTarget, let audioSpan else { return }
+      let overlap = videoRange.intersection(audioSpan)
+      guard overlap.duration.isValid, overlap.duration.seconds > 0.02 else { return }
+      let offset = CMTimeSubtract(overlap.start, videoRange.start)
+      let insertAt = CMTimeAdd(atTime, offset)
+      try? audioTarget.insertTimeRange(overlap, of: audio, at: insertAt)
+      guard let slowed else { return }
+      let audioSlowed = CMTimeMultiplyByFloat64(overlap.duration, multiplier: 2)
+      audioTarget.scaleTimeRange(
+        CMTimeRange(start: insertAt, duration: overlap.duration),
+        toDuration: audioSlowed
+      )
+    }
+    if range.duration.seconds + 0.05 >= slot.seconds {
+      let use = minTime(range.duration, slot)
+      let piece = CMTimeRange(start: range.start, duration: use)
+      try compositionVideo.insertTimeRange(piece, of: track, at: cursor)
+      layAudio(videoRange: piece, at: cursor, slowed: nil)
+      return use
+    }
+    let slowed = CMTimeMultiplyByFloat64(range.duration, multiplier: 2)
+    var local = CMTime.zero
+    var loops = 0
+    while local.seconds < slot.seconds - 0.02 {
+      loops += 1
+      if loops > 40 {
+        throw PosterError.message("背景太短，铺不满这段文案")
+      }
+      let at = CMTimeAdd(cursor, local)
+      try compositionVideo.insertTimeRange(range, of: track, at: at)
+      compositionVideo.scaleTimeRange(CMTimeRange(start: at, duration: range.duration), toDuration: slowed)
+      layAudio(videoRange: range, at: at, slowed: slowed)
+      local = CMTimeAdd(local, slowed)
+    }
+    if local.seconds > slot.seconds + 0.02 {
+      let cut = CMTimeAdd(cursor, slot)
+      let end = CMTimeAdd(cursor, local)
+      let extra = CMTimeRange(start: cut, duration: CMTimeSubtract(end, cut))
+      compositionVideo.removeTimeRange(extra)
+      if let audioTarget {
+        let audioRange = try await audioTarget.load(.timeRange)
+        let hit = extra.intersection(audioRange)
+        if hit.isValid, hit.duration.isValid, hit.duration.seconds > 0.001 {
+          audioTarget.removeTimeRange(hit)
+        }
+      }
+      return slot
+    }
+    return local
+  }
+
+  private static func fillTransform(_ track: AVAssetTrack, canvas: CGSize) async throws -> CGAffineTransform {
+    let natural = try await track.load(.naturalSize)
+    let preferred = try await track.load(.preferredTransform)
+    let oriented = CGRect(origin: .zero, size: natural).applying(preferred)
+    let upright = preferred.concatenating(
+      CGAffineTransform(translationX: -oriented.origin.x, y: -oriented.origin.y)
+    )
+    let display = CGSize(width: max(abs(oriented.width), 2), height: max(abs(oriented.height), 2))
+    let scale = max(canvas.width / display.width, canvas.height / display.height)
+    let dx = (canvas.width - display.width * scale) / 2
+    let dy = (canvas.height - display.height * scale) / 2
+    return upright
+      .concatenating(CGAffineTransform(scaleX: scale, y: scale))
+      .concatenating(CGAffineTransform(translationX: dx, y: dy))
+  }
+
+  private static func writeKenBurns(
+    imageURL: URL,
+    size: CGSize,
+    seconds: Double,
+    fadeIn: Bool,
+    fadeOut: Bool
+  ) async throws -> URL {
+    guard let source = UIImage(data: (try? Data(contentsOf: imageURL)) ?? Data()),
+          let image = uprightImage(source, maxSide: 1920) else {
+      throw PosterError.message("这张背景图片无法读取")
+    }
+    let width = Int(size.width)
+    let height = Int(size.height)
+    let url = FileManager.default.temporaryDirectory.appendingPathComponent("poster-photo-\(UUID().uuidString).mp4")
+    if FileManager.default.fileExists(atPath: url.path) {
+      try FileManager.default.removeItem(at: url)
+    }
+    let writer = try AVAssetWriter(outputURL: url, fileType: .mp4)
+    let input = AVAssetWriterInput(mediaType: .video, outputSettings: [
+      AVVideoCodecKey: AVVideoCodecType.h264,
+      AVVideoWidthKey: width,
+      AVVideoHeightKey: height,
+    ])
+    input.expectsMediaDataInRealTime = false
+    let adaptor = AVAssetWriterInputPixelBufferAdaptor(
+      assetWriterInput: input,
+      sourcePixelBufferAttributes: [
+        kCVPixelBufferPixelFormatTypeKey as String: Int(kCVPixelFormatType_32BGRA),
+        kCVPixelBufferWidthKey as String: width,
+        kCVPixelBufferHeightKey as String: height,
+      ]
+    )
+    guard writer.canAdd(input) else {
+      throw PosterError.message("无法生成图片背景")
+    }
+    writer.add(input)
+    guard writer.startWriting() else {
+      throw PosterError.message(writer.error?.localizedDescription ?? "无法生成图片背景")
+    }
+    writer.startSession(atSourceTime: .zero)
+    let frameCount = max(Int((seconds * 30).rounded()), 30)
+    try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+      let queue = DispatchQueue(label: "poster.photo")
+      var index = 0
+      var finished = false
+      input.requestMediaDataWhenReady(on: queue) {
+        while input.isReadyForMoreMediaData && !finished {
+          if index >= frameCount {
+            finished = true
+            writer.endSession(atSourceTime: CMTime(value: CMTimeValue(frameCount), timescale: 30))
+            input.markAsFinished()
+            writer.finishWriting {
+              if writer.status == .completed {
+                continuation.resume()
+              } else {
+                continuation.resume(throwing: PosterError.message(writer.error?.localizedDescription ?? "图片背景导出失败"))
+              }
+            }
+            return
+          }
+          let progress = CGFloat(index) / CGFloat(max(frameCount - 1, 1))
+          let timeSeconds = Double(index) / 30.0
+          var alpha: CGFloat = 1
+          if fadeIn {
+            alpha = min(alpha, CGFloat(min(max(timeSeconds / 0.35, 0), 1)))
+          }
+          if fadeOut {
+            alpha = min(alpha, CGFloat(min(max((seconds - timeSeconds) / 0.35, 0), 1)))
+          }
+          guard let buffer = imageBuffer(image, width: width, height: height, progress: progress, alpha: alpha, pool: adaptor.pixelBufferPool) else {
+            finished = true
+            input.markAsFinished()
+            continuation.resume(throwing: PosterError.message("无法绘制背景图片"))
+            return
+          }
+          let time = CMTime(value: CMTimeValue(index), timescale: 30)
+          if !adaptor.append(buffer, withPresentationTime: time) {
+            finished = true
+            input.markAsFinished()
+            continuation.resume(throwing: PosterError.message(writer.error?.localizedDescription ?? "图片背景写入失败"))
+            return
+          }
+          index += 1
+        }
+      }
+    }
+    return url
+  }
+
+  private static func uprightImage(_ image: UIImage, maxSide: CGFloat) -> CGImage? {
+    let source = image.size
+    guard source.width > 1, source.height > 1 else { return nil }
+    let longSide = max(source.width, source.height)
+    let fit = longSide > maxSide ? maxSide / longSide : 1
+    let size = CGSize(width: max(2, floor(source.width * fit)), height: max(2, floor(source.height * fit)))
+    let format = UIGraphicsImageRendererFormat()
+    format.scale = 1
+    format.opaque = true
+    let renderer = UIGraphicsImageRenderer(size: size, format: format)
+    return renderer.image { _ in
+      image.draw(in: CGRect(origin: .zero, size: size))
+    }.cgImage
+  }
+
+  private static func imageBuffer(
+    _ image: CGImage,
+    width: Int,
+    height: Int,
+    progress: CGFloat,
+    alpha: CGFloat,
+    pool: CVPixelBufferPool?
+  ) -> CVPixelBuffer? {
+    var pixel: CVPixelBuffer?
+    if let pool {
+      CVPixelBufferPoolCreatePixelBuffer(nil, pool, &pixel)
+    } else {
+      CVPixelBufferCreate(nil, width, height, kCVPixelFormatType_32BGRA, nil, &pixel)
+    }
+    guard let pixel else { return nil }
+    CVPixelBufferLockBaseAddress(pixel, [])
+    defer { CVPixelBufferUnlockBaseAddress(pixel, []) }
+    guard let base = CVPixelBufferGetBaseAddress(pixel) else { return nil }
+    let bytesPerRow = CVPixelBufferGetBytesPerRow(pixel)
+    guard let context = CGContext(
+      data: base,
+      width: width,
+      height: height,
+      bitsPerComponent: 8,
+      bytesPerRow: bytesPerRow,
+      space: CGColorSpaceCreateDeviceRGB(),
+      bitmapInfo: CGImageAlphaInfo.premultipliedFirst.rawValue | CGBitmapInfo.byteOrder32Little.rawValue
+    ) else {
+      return nil
+    }
+    context.setFillColor(CGColor(red: 0, green: 0, blue: 0, alpha: 1))
+    context.fill(CGRect(x: 0, y: 0, width: width, height: height))
+    let source = CGSize(width: image.width, height: image.height)
+    guard source.width > 1, source.height > 1 else { return nil }
+    let zoom = 1 + 0.16 * sin(progress * .pi)
+    let scale = max(CGFloat(width) / source.width, CGFloat(height) / source.height) * zoom
+    let drawSize = CGSize(width: source.width * scale, height: source.height * scale)
+    let origin = CGPoint(x: (CGFloat(width) - drawSize.width) / 2, y: (CGFloat(height) - drawSize.height) / 2)
+    context.interpolationQuality = .high
+    context.setAlpha(min(max(alpha, 0), 1))
+    context.draw(image, in: CGRect(origin: origin, size: drawSize))
+    return pixel
   }
 
   private struct Card {
@@ -185,10 +642,6 @@ enum PosterMaker {
     parent.frame = canvas
     videoLayer.frame = canvas
     parent.isGeometryFlipped = true
-    parent.masksToBounds = true
-    var perspective = CATransform3DIdentity
-    perspective.m34 = -1 / 700
-    parent.sublayerTransform = perspective
     parent.addSublayer(videoLayer)
 
     let width = renderSize.width * 0.88
@@ -239,8 +692,6 @@ enum PosterMaker {
     let text = NSMutableAttributedString()
     let base: [NSAttributedString.Key: Any] = [
       .font: font,
-      .strokeColor: UIColor.black,
-      .strokeWidth: -6,
       .paragraphStyle: paragraph,
     ]
     if let match = headline.range(of: #"^第[0-9]+名"#, options: .regularExpression) {
@@ -260,16 +711,22 @@ enum PosterMaker {
       options: [.usesLineFragmentOrigin, .usesFontLeading],
       context: nil
     )
-    return (text, CGSize(width: width, height: ceil(bounds.height) + 8))
+    return (text, CGSize(width: width, height: ceil(bounds.height) + font.pointSize * 0.45))
   }
 
-  private static func textLayer(_ string: NSAttributedString, size: CGSize) -> CATextLayer {
-    let layer = CATextLayer()
-    layer.string = string
-    layer.alignmentMode = .center
-    layer.contentsScale = 2
-    layer.isWrapped = true
-    layer.bounds = CGRect(origin: .zero, size: size)
+  private static func textLayer(_ string: NSAttributedString, size: CGSize) -> CALayer {
+    let pad = CGSize(width: ceil(size.width + 16), height: ceil(size.height + 20))
+    let format = UIGraphicsImageRendererFormat()
+    format.scale = 2
+    format.opaque = false
+    let image = UIGraphicsImageRenderer(size: pad, format: format).image { _ in
+      string.draw(with: CGRect(x: 8, y: 10, width: size.width, height: size.height), options: [.usesLineFragmentOrigin, .usesFontLeading], context: nil)
+    }
+    let layer = CALayer()
+    layer.contents = image.cgImage
+    layer.contentsScale = format.scale
+    layer.contentsGravity = .resize
+    layer.bounds = CGRect(origin: .zero, size: pad)
     layer.anchorPoint = CGPoint(x: 0.5, y: 0.5)
     layer.shadowColor = UIColor.black.cgColor
     layer.shadowOpacity = 0.85
@@ -285,7 +742,7 @@ enum PosterMaker {
       attributes: [.font: font],
       context: nil
     )
-    return CGSize(width: width, height: ceil(bounds.height) + 8)
+    return CGSize(width: width, height: ceil(bounds.height) + font.pointSize * 0.45)
   }
 
   private static func hold(_ layer: CALayer, start: Double, end: Double, videoDuration: Double) {
@@ -318,28 +775,14 @@ enum PosterMaker {
     parent.frame = canvas
     videoLayer.frame = canvas
     parent.isGeometryFlipped = true
-    parent.masksToBounds = true
-    var perspective = CATransform3DIdentity
-    perspective.m34 = -1 / 700
-    parent.sublayerTransform = perspective
     parent.addSublayer(videoLayer)
 
     let totalHeight = fitted.sizes.reduce(0) { $0 + $1.height } + fitted.gap * CGFloat(max(rows.count - 1, 0))
     var top = (renderSize.height - totalHeight) / 2
     for (index, row) in rows.enumerated() {
       let box = fitted.sizes[index]
-      let layer = CATextLayer()
-      layer.string = styled(row, font: fitted.font)
-      layer.alignmentMode = .center
-      layer.contentsScale = 2
-      layer.isWrapped = false
-      layer.bounds = CGRect(origin: .zero, size: box)
-      layer.anchorPoint = CGPoint(x: 0.5, y: 0.5)
+      let layer = textLayer(styled(row, font: fitted.font), size: box)
       layer.position = CGPoint(x: renderSize.width / 2, y: top + box.height / 2)
-      layer.shadowColor = UIColor.black.cgColor
-      layer.shadowOpacity = 0.85
-      layer.shadowRadius = max(4, fitted.font.pointSize * 0.06)
-      layer.shadowOffset = .zero
       flip(layer, delay: clock.gap * Double(index), duration: clock.flip)
       parent.addSublayer(layer)
       top += box.height + fitted.gap
@@ -349,29 +792,29 @@ enum PosterMaker {
   }
 
   private static func spinIn(_ layer: CALayer, delay: Double) {
-    layer.transform = CATransform3DMakeRotation(-.pi / 2, 1, 0, 0)
-    let spin = CABasicAnimation(keyPath: "transform.rotation.x")
-    spin.fromValue = -Double.pi / 2
-    spin.toValue = 0
-    spin.duration = 0.34
-    spin.beginTime = AVCoreAnimationBeginTimeAtZero + delay
-    spin.timingFunction = CAMediaTimingFunction(name: .easeOut)
-    spin.fillMode = .both
-    spin.isRemovedOnCompletion = false
-    layer.add(spin, forKey: "poster-flip")
+    layer.transform = CATransform3DIdentity
+    let scale = CABasicAnimation(keyPath: "transform.scale")
+    scale.fromValue = 0.92
+    scale.toValue = 1
+    scale.duration = 0.28
+    scale.beginTime = AVCoreAnimationBeginTimeAtZero + delay
+    scale.timingFunction = CAMediaTimingFunction(name: .easeOut)
+    scale.fillMode = .both
+    scale.isRemovedOnCompletion = false
+    layer.add(scale, forKey: "poster-scale")
   }
 
   private static func flip(_ layer: CALayer, delay: Double, duration: Double) {
-    layer.transform = CATransform3DMakeRotation(-.pi / 2, 1, 0, 0)
-    layer.opacity = 0
-    let spin = CABasicAnimation(keyPath: "transform.rotation.x")
-    spin.fromValue = -Double.pi / 2
-    spin.toValue = 0
-    spin.duration = max(duration, 0.12)
-    spin.beginTime = AVCoreAnimationBeginTimeAtZero + delay
-    spin.timingFunction = CAMediaTimingFunction(name: .easeOut)
-    spin.fillMode = .both
-    spin.isRemovedOnCompletion = false
+    layer.transform = CATransform3DIdentity
+    layer.opacity = 1
+    let scale = CABasicAnimation(keyPath: "transform.scale")
+    scale.fromValue = 0.92
+    scale.toValue = 1
+    scale.duration = max(duration, 0.12)
+    scale.beginTime = AVCoreAnimationBeginTimeAtZero + delay
+    scale.timingFunction = CAMediaTimingFunction(name: .easeOut)
+    scale.fillMode = .both
+    scale.isRemovedOnCompletion = false
     let fade = CABasicAnimation(keyPath: "opacity")
     fade.fromValue = 0
     fade.toValue = 1
@@ -379,7 +822,7 @@ enum PosterMaker {
     fade.beginTime = AVCoreAnimationBeginTimeAtZero + delay
     fade.fillMode = .both
     fade.isRemovedOnCompletion = false
-    layer.add(spin, forKey: "poster-flip")
+    layer.add(scale, forKey: "poster-scale")
     layer.add(fade, forKey: "poster-fade")
   }
 
@@ -389,8 +832,6 @@ enum PosterMaker {
     return NSAttributedString(string: text, attributes: [
       .font: font,
       .foregroundColor: UIColor.white,
-      .strokeColor: UIColor.black,
-      .strokeWidth: -8,
       .paragraphStyle: paragraph,
     ])
   }
@@ -415,8 +856,8 @@ enum PosterMaker {
 
   private static func measure(_ text: String, font: UIFont) -> CGSize {
     let size = (text as NSString).size(withAttributes: [.font: font])
-    let pad = font.pointSize * 0.28
-    return CGSize(width: ceil(size.width + pad), height: ceil(size.height + font.pointSize * 0.12))
+    let pad = font.pointSize * 0.42
+    return CGSize(width: ceil(size.width + pad), height: ceil(size.height + font.pointSize * 0.45))
   }
 
   private static func timing(lineCount: Int, limit: Double?) -> (gap: Double, flip: Double, total: Double) {
@@ -562,29 +1003,52 @@ enum PosterMaker {
       AVAssetExportPreset1280x720,
       AVAssetExportPresetMediumQuality,
     ]
-    let preset = preferred.first(where: { compatible.contains($0) }) ?? AVAssetExportPresetHighestQuality
-    guard let session = AVAssetExportSession(asset: composition, presetName: preset) else {
-      throw PosterError.message("系统无法导出大字报")
+    var presets = preferred.filter { compatible.contains($0) }
+    if presets.isEmpty {
+      presets = preferred
     }
-    session.outputURL = output
-    session.outputFileType = .mp4
-    session.videoComposition = videoComposition
-    session.shouldOptimizeForNetworkUse = true
-    try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
-      session.exportAsynchronously {
-        switch session.status {
-        case .completed:
-          continuation.resume()
-        case .cancelled:
-          continuation.resume(throwing: PosterError.message("制作已取消"))
-        default:
-          continuation.resume(throwing: PosterError.message(session.error?.localizedDescription ?? "制作失败"))
+    var last = "制作失败"
+    for preset in presets {
+      if FileManager.default.fileExists(atPath: output.path) {
+        try? FileManager.default.removeItem(at: output)
+      }
+      guard let session = AVAssetExportSession(asset: composition, presetName: preset) else {
+        last = "系统无法导出大字报"
+        continue
+      }
+      session.outputURL = output
+      session.outputFileType = .mp4
+      session.videoComposition = videoComposition
+      session.shouldOptimizeForNetworkUse = false
+      let failure: String? = await withCheckedContinuation { continuation in
+        session.exportAsynchronously {
+          switch session.status {
+          case .completed:
+            continuation.resume(returning: nil)
+          case .cancelled:
+            continuation.resume(returning: "制作已取消")
+          default:
+            let ns = session.error as NSError?
+            if ns?.domain == AVFoundationErrorDomain, ns?.code == -11841 {
+              continuation.resume(returning: "画面合成不合法（-11841）。请重试。")
+            } else if ns?.domain == AVFoundationErrorDomain, ns?.code == -11880 {
+              continuation.resume(returning: "这个背景的画面时间不连续，系统没法按原样制作（-11880）")
+            } else {
+              continuation.resume(returning: session.error?.localizedDescription ?? "制作失败")
+            }
+          }
         }
       }
+      if failure == nil, FileManager.default.fileExists(atPath: output.path) {
+        return
+      }
+      if failure == "制作已取消" {
+        throw PosterError.message("制作已取消")
+      }
+      last = failure ?? "制作完成但没有生成文件"
+      try? FileManager.default.removeItem(at: output)
     }
-    guard FileManager.default.fileExists(atPath: output.path) else {
-      throw PosterError.message("制作完成但没有生成文件")
-    }
+    throw PosterError.message(last)
   }
 
   private static func evenSize(_ size: CGSize) -> CGSize {
@@ -594,6 +1058,91 @@ enum PosterMaker {
       return CGFloat(max(2, next))
     }
     return CGSize(width: even(size.width), height: even(size.height))
+  }
+
+  private static func cover(
+    video: AVAssetTrack,
+    audio: AVAssetTrack?,
+    sourceRange: CMTimeRange,
+    target: CMTime,
+    composition: AVMutableComposition,
+    compositionVideo: AVMutableCompositionTrack
+  ) async throws -> AVMutableCompositionTrack? {
+    var compositionAudio: AVMutableCompositionTrack?
+    let audioSpan: CMTimeRange?
+    if let audio {
+      audioSpan = try await audio.load(.timeRange)
+    } else {
+      audioSpan = nil
+    }
+    if audio != nil {
+      compositionAudio = composition.addMutableTrack(
+        withMediaType: .audio,
+        preferredTrackID: kCMPersistentTrackID_Invalid
+      )
+    }
+    let slowed = CMTimeMultiplyByFloat64(sourceRange.duration, multiplier: 2)
+    var cursor = CMTime.zero
+    var loops = 0
+    while cursor.seconds < target.seconds - 0.02 {
+      loops += 1
+      if loops > 80 {
+        throw PosterError.message("背景太短，铺不满这段文案")
+      }
+      try compositionVideo.insertTimeRange(sourceRange, of: video, at: cursor)
+      compositionVideo.scaleTimeRange(CMTimeRange(start: cursor, duration: sourceRange.duration), toDuration: slowed)
+      if let audio, let compositionAudio, let audioSpan {
+        let overlap = sourceRange.intersection(audioSpan)
+        if overlap.duration.isValid, overlap.duration.seconds > 0.02 {
+          let offset = CMTimeSubtract(overlap.start, sourceRange.start)
+          let insertAt = CMTimeAdd(cursor, offset)
+          try? compositionAudio.insertTimeRange(overlap, of: audio, at: insertAt)
+          let audioSlowed = CMTimeMultiplyByFloat64(overlap.duration, multiplier: 2)
+          compositionAudio.scaleTimeRange(
+            CMTimeRange(start: insertAt, duration: overlap.duration),
+            toDuration: audioSlowed
+          )
+        }
+      }
+      cursor = CMTimeAdd(cursor, slowed)
+    }
+    if compositionAudio == nil {
+      return nil
+    }
+    let kept = try await compositionAudio?.load(.timeRange)
+    if kept == nil || (kept?.duration.seconds ?? 0) < 0.02 {
+      if let compositionAudio {
+        composition.removeTrack(compositionAudio)
+      }
+      return nil
+    }
+    return compositionAudio
+  }
+
+  private static func zoomAround(_ transform: CGAffineTransform, renderSize: CGSize, scale: CGFloat) -> CGAffineTransform {
+    let centerX = renderSize.width / 2
+    let centerY = renderSize.height / 2
+    return transform
+      .concatenating(CGAffineTransform(translationX: -centerX, y: -centerY))
+      .concatenating(CGAffineTransform(scaleX: scale, y: scale))
+      .concatenating(CGAffineTransform(translationX: centerX, y: centerY))
+  }
+
+  private static func scriptSeconds(ranked: Bool, rankCount: Int, lineCount: Int) -> Double {
+    if ranked {
+      return 1.2 + Double(max(rankCount, 1)) * 3.4
+    }
+    return timing(lineCount: lineCount, limit: nil).total
+  }
+
+  private static func flag(_ options: [String: Any], key: String, default defaultValue: Bool) -> Bool {
+    if let value = options[key] as? Bool {
+      return value
+    }
+    if let value = options[key] as? NSNumber {
+      return value.boolValue
+    }
+    return defaultValue
   }
 
   private static func minTime(_ left: CMTime, _ right: CMTime) -> CMTime {

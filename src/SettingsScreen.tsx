@@ -1,13 +1,90 @@
 import { useState } from 'react';
-import { ActivityIndicator, Alert, Pressable, ScrollView, StyleSheet, Text, View } from 'react-native';
+import { ActivityIndicator, Alert, Linking, Pressable, ScrollView, StyleSheet, Text, View } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import VideoFlip from '../modules/video-flip';
 import { themeColors, useTheme, type Appearance } from './theme';
+
+type Page = 'menu' | 'music' | 'footage' | 'look';
+
+type Material = {
+  title: string;
+  search: string;
+  detail: string;
+  url: string;
+};
+
+const MUSIC: Material[] = [
+  {
+    title: '轻快卡点',
+    search: '轻快卡点',
+    detail: '适合排行榜一条条翻页。鼓点短，节奏清楚，字出来的时候正好踩拍。',
+    url: 'https://mixkit.co/free-stock-music/tag/upbeat/',
+  },
+  {
+    title: '悬疑推进',
+    search: '悬疑鼓点',
+    detail: '适合从第 5 名推到第 1 名。低音往前走，名字出现时有一点紧张感。',
+    url: 'https://mixkit.co/free-stock-music/tag/cinematic/',
+  },
+  {
+    title: '温暖钢琴',
+    search: '温暖钢琴',
+    detail: '适合慢一点的介绍。钢琴为主，不抢旁白。',
+    url: 'https://mixkit.co/free-stock-music/mood/inspiring/',
+  },
+  {
+    title: '热血电子',
+    search: '热血电子',
+    detail: '适合快节奏榜单。电子鼓和合成器，画面可以配慢慢放大的背景。',
+    url: 'https://mixkit.co/free-stock-music/tag/hip-hop/',
+  },
+  {
+    title: '口播底乐',
+    search: '口播清新',
+    detail: '适合有字幕解说的视频。音量低，说话时还能听清人声。',
+    url: 'https://mixkit.co/free-stock-music/tag/ambient/',
+  },
+];
+
+const FOOTAGE: Material[] = [
+  {
+    title: '城市夜景',
+    search: '城市夜景',
+    detail: '竖屏街灯和车流，适合深色大字。下载后到大字报里选为背景。',
+    url: 'https://mixkit.co/free-stock-video/city/',
+  },
+  {
+    title: '美食特写',
+    search: '美食特写',
+    detail: '汉堡、炸鸡、饮品的近景，适合吃播排行榜。',
+    url: 'https://mixkit.co/free-stock-video/food/',
+  },
+  {
+    title: '光斑粒子',
+    search: '粒子光斑',
+    detail: '暗底上的光点，字不容易和画面抢。适合标题和名次。',
+    url: 'https://mixkit.co/free-stock-video/light/',
+  },
+  {
+    title: '自然空镜',
+    search: '自然空镜',
+    detail: '天、水、树的慢镜头。文案长的时候适合放慢并铺满。',
+    url: 'https://mixkit.co/free-stock-video/nature/',
+  },
+  {
+    title: '抽象渐变',
+    search: '抽象渐变',
+    detail: '颜色慢慢流动的底。没有具体物体，字最清楚。',
+    url: 'https://mixkit.co/free-stock-video/abstract/',
+  },
+];
 
 export function SettingsScreen() {
   const insets = useSafeAreaInsets();
   const { color, setColor, appearance, setAppearance, palette } = useTheme();
   const [clearing, setClearing] = useState(false);
+  const [page, setPage] = useState<Page>('menu');
+  const [opened, setOpened] = useState<Material | null>(null);
 
   const clearCache = () => {
     if (clearing) return;
@@ -24,9 +101,121 @@ export function SettingsScreen() {
     }
   };
 
+  const openLink = (url: string) => {
+    void Linking.openURL(url).catch(() => {
+      Alert.alert('无法打开', '这个素材页面没有打开，可以稍后再试。');
+    });
+  };
+
+  if (opened) {
+    return (
+      <View style={[styles.screen, { paddingTop: insets.top + 8 }]}>
+        <Pressable
+          onPress={() => setOpened(null)}
+          hitSlop={8}
+        >
+          <Text style={[styles.back, { color }]}>返回</Text>
+        </Pressable>
+        <Text style={[styles.title, { color: palette.text }]}>{opened.title}</Text>
+        <Text style={[styles.subtitle, { color: palette.muted }]}>在剪映里可以搜「{opened.search}」。</Text>
+        <ScrollView contentContainerStyle={styles.list}>
+          <View style={[styles.row, { backgroundColor: palette.card, borderColor: palette.line }]}>
+            <Text style={[styles.detail, { color: palette.text }]}>{opened.detail}</Text>
+          </View>
+          <Pressable
+            style={[styles.row, { backgroundColor: palette.card, borderColor: palette.line }]}
+            onPress={() => openLink(opened.url)}
+          >
+            <View style={styles.rowBody}>
+              <Text style={[styles.rowTitle, { color: palette.text }]}>打开免费素材</Text>
+              <Text style={[styles.rowHint, { color: palette.muted }]}>浏览器里试听或下载，再回到相册或文件里选用。</Text>
+            </View>
+            <Text style={[styles.chevron, { color }]}>打开</Text>
+          </Pressable>
+        </ScrollView>
+      </View>
+    );
+  }
+
+  if (page === 'music' || page === 'footage') {
+    const items = page === 'music' ? MUSIC : FOOTAGE;
+    return (
+      <View style={[styles.screen, { paddingTop: insets.top + 8 }]}>
+        <Pressable onPress={() => setPage('menu')} hitSlop={8}>
+          <Text style={[styles.back, { color }]}>返回</Text>
+        </Pressable>
+        <Text style={[styles.title, { color: palette.text }]}>{page === 'music' ? '剪映背景音乐' : '剪映背景素材'}</Text>
+        <Text style={[styles.subtitle, { color: palette.muted }]}>
+          {page === 'music'
+            ? '这些是和剪映里常见风格一样、可以免费使用的音乐。点进去看说明。'
+            : '这些是可以免费使用的背景画面。下载后到大字报里选为背景。'}
+        </Text>
+        <ScrollView contentContainerStyle={styles.list}>
+          {items.map((item) => (
+            <Pressable
+              key={item.title}
+              style={[styles.row, { backgroundColor: palette.card, borderColor: palette.line }]}
+              onPress={() => setOpened(item)}
+            >
+              <View style={styles.rowBody}>
+                <Text style={[styles.rowTitle, { color: palette.text }]}>{item.title}</Text>
+                <Text style={[styles.rowHint, { color: palette.muted }]}>剪映搜索：{item.search}</Text>
+              </View>
+              <Text style={[styles.chevron, { color }]}>进入</Text>
+            </Pressable>
+          ))}
+        </ScrollView>
+      </View>
+    );
+  }
+
+  if (page === 'menu') {
+    return (
+      <View style={[styles.screen, { paddingTop: insets.top + 8 }]}>
+        <Text style={[styles.title, { color: palette.text }]}>设置</Text>
+        <Text style={[styles.subtitle, { color: palette.muted }]}>点进去查看素材，或调整外观。</Text>
+        <ScrollView contentContainerStyle={styles.list}>
+          <Pressable
+            style={[styles.row, { backgroundColor: palette.card, borderColor: palette.line }]}
+            onPress={() => setPage('music')}
+          >
+            <View style={styles.rowBody}>
+              <Text style={[styles.rowTitle, { color: palette.text }]}>剪映背景音乐</Text>
+              <Text style={[styles.rowHint, { color: palette.muted }]}>卡点、钢琴、口播底乐</Text>
+            </View>
+            <Text style={[styles.chevron, { color }]}>进入</Text>
+          </Pressable>
+          <Pressable
+            style={[styles.row, { backgroundColor: palette.card, borderColor: palette.line }]}
+            onPress={() => setPage('footage')}
+          >
+            <View style={styles.rowBody}>
+              <Text style={[styles.rowTitle, { color: palette.text }]}>剪映背景素材</Text>
+              <Text style={[styles.rowHint, { color: palette.muted }]}>夜景、美食、光斑、空镜</Text>
+            </View>
+            <Text style={[styles.chevron, { color }]}>进入</Text>
+          </Pressable>
+          <Pressable
+            style={[styles.row, { backgroundColor: palette.card, borderColor: palette.line }]}
+            onPress={() => setPage('look')}
+          >
+            <View style={styles.rowBody}>
+              <Text style={[styles.rowTitle, { color: palette.text }]}>外观和缓存</Text>
+              <Text style={[styles.rowHint, { color: palette.muted }]}>夜间、白天、主题色、清除临时文件</Text>
+            </View>
+            <Text style={[styles.chevron, { color }]}>进入</Text>
+          </Pressable>
+        </ScrollView>
+      </View>
+    );
+  }
+
   return (
     <View style={[styles.screen, { paddingTop: insets.top + 8 }]}>
-      <Text style={[styles.title, { color: palette.text }]}>设置</Text>
+      <Pressable onPress={() => setPage('menu')} hitSlop={8}>
+        <Text style={[styles.back, { color }]}>返回</Text>
+      </Pressable>
+      <Text style={[styles.title, { color: palette.text }]}>外观和缓存</Text>
       <Text style={[styles.subtitle, { color: palette.muted }]}>夜间是深色，白天是白底。主题色只改按钮和开关。</Text>
       <ScrollView contentContainerStyle={styles.list}>
         <View style={[styles.row, { backgroundColor: palette.card, borderColor: palette.line }]}>
@@ -109,6 +298,16 @@ const styles = StyleSheet.create({
     color: '#9BB0C5',
     fontSize: 14,
     lineHeight: 20,
+  },
+  back: {
+    fontSize: 15,
+    fontWeight: '700',
+    marginBottom: 8,
+  },
+  detail: {
+    flex: 1,
+    fontSize: 15,
+    lineHeight: 22,
   },
   list: {
     gap: 12,

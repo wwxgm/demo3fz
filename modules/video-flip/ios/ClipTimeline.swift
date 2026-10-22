@@ -32,7 +32,8 @@ enum ClipTimeline {
     audio: AVAssetTrack?,
     sourceStart: CMTime,
     sourceDuration: CMTime,
-    extend: ClipExtend
+    extend: ClipExtend,
+    skip: CMTimeRange? = nil
   ) async throws -> Result {
     let duration = sourceDuration.seconds
     let audioSpan: CMTimeRange?
@@ -77,7 +78,7 @@ enum ClipTimeline {
     let media = CMTimeRange(start: sourceStart, duration: sourceDuration)
 
     if insertAt > 0.05 {
-      cursor = try append(
+      cursor = try appendAround(
         video: video,
         audio: audio,
         compositionVideo: compositionVideo,
@@ -87,7 +88,8 @@ enum ClipTimeline {
         sourceStart: sourceTime(0, base: sourceStart),
         length: seconds(insertAt),
         at: cursor,
-        includeAudio: true
+        includeAudio: true,
+        skip: skip
       )
     }
 
@@ -95,6 +97,18 @@ enum ClipTimeline {
     var freezeStart = CMTimeSubtract(sourceTime(insertAt, base: sourceStart), oneFrame)
     if CMTimeCompare(freezeStart, media.start) < 0 {
       freezeStart = media.start
+    }
+    if let skip {
+      let probe = CMTimeRange(start: freezeStart, duration: oneFrame)
+      let hit = probe.intersection(skip)
+      if hit.isValid, hit.duration.isValid, hit.duration.seconds > 0.0005 {
+        let before = CMTimeSubtract(skip.start, oneFrame)
+        if CMTimeCompare(before, media.start) >= 0 {
+          freezeStart = before
+        } else {
+          freezeStart = CMTimeAdd(skip.start, skip.duration)
+        }
+      }
     }
     guard let freezePiece = fit(freezeStart, oneFrame, media: media) else {
       throw ClipTimelineError.message("无法截取定格画面")
@@ -106,37 +120,74 @@ enum ClipTimeline {
     cursor = CMTimeAdd(freezeAt, seconds(extend.freeze))
 
     let replayAt = cursor
-    guard let replayPiece = fit(sourceTime(start, base: sourceStart), seconds(end - start), media: media) else {
-      throw ClipTimelineError.message("无法插入延长片段")
-    }
-    try compositionVideo.insertTimeRange(replayPiece, of: video, at: replayAt)
     var replayRange: CMTimeRange?
     let slow = extend.mode == "slow" || extend.mode == "slowZoom"
-    let replayTarget = CMTimeRange(start: replayAt, duration: replayPiece.duration)
-    if slow {
-      let slowed = CMTimeMultiplyByFloat64(replayPiece.duration, multiplier: 2)
-      compositionVideo.scaleTimeRange(replayTarget, toDuration: slowed)
-      cursor = CMTimeAdd(replayAt, slowed)
-      if extend.mode == "slowZoom" {
-        replayRange = CMTimeRange(start: replayAt, duration: slowed)
+    if let skip {
+      let pieces = parts(start: sourceTime(start, base: sourceStart), length: seconds(end - start), skip: skip)
+      guard !pieces.isEmpty else {
+        throw ClipTimelineError.message("要延长的这一段正好在移除范围内")
+      }
+      var inserted = false
+      for piece in pieces {
+        let at = cursor
+        guard let fitted = fit(piece.0, piece.1, media: media) else { continue }
+        try compositionVideo.insertTimeRange(fitted, of: video, at: at)
+        inserted = true
+        if slow {
+          let slowed = CMTimeMultiplyByFloat64(fitted.duration, multiplier: 2)
+          compositionVideo.scaleTimeRange(CMTimeRange(start: at, duration: fitted.duration), toDuration: slowed)
+          cursor = CMTimeAdd(at, slowed)
+        } else {
+          if let audio, let compositionAudio {
+            insertAudio(
+              audio,
+              compositionAudio: compositionAudio,
+              audioSpan: audioSpan,
+              sourceStart: fitted.start,
+              length: fitted.duration,
+              at: at
+            )
+          }
+          cursor = CMTimeAdd(at, fitted.duration)
+        }
+      }
+      guard inserted else {
+        throw ClipTimelineError.message("无法插入延长片段")
+      }
+      if extend.mode == "slowZoom", CMTimeCompare(cursor, replayAt) > 0 {
+        replayRange = CMTimeRange(start: replayAt, duration: CMTimeSubtract(cursor, replayAt))
       }
     } else {
-      if let audio, let compositionAudio {
-        insertAudio(
-          audio,
-          compositionAudio: compositionAudio,
-          audioSpan: audioSpan,
-          sourceStart: replayPiece.start,
-          length: replayPiece.duration,
-          at: replayAt
-        )
+      guard let replayPiece = fit(sourceTime(start, base: sourceStart), seconds(end - start), media: media) else {
+        throw ClipTimelineError.message("无法插入延长片段")
       }
-      cursor = CMTimeAdd(replayTarget.start, replayTarget.duration)
+      try compositionVideo.insertTimeRange(replayPiece, of: video, at: replayAt)
+      let replayTarget = CMTimeRange(start: replayAt, duration: replayPiece.duration)
+      if slow {
+        let slowed = CMTimeMultiplyByFloat64(replayPiece.duration, multiplier: 2)
+        compositionVideo.scaleTimeRange(replayTarget, toDuration: slowed)
+        cursor = CMTimeAdd(replayAt, slowed)
+        if extend.mode == "slowZoom" {
+          replayRange = CMTimeRange(start: replayAt, duration: slowed)
+        }
+      } else {
+        if let audio, let compositionAudio {
+          insertAudio(
+            audio,
+            compositionAudio: compositionAudio,
+            audioSpan: audioSpan,
+            sourceStart: replayPiece.start,
+            length: replayPiece.duration,
+            at: replayAt
+          )
+        }
+        cursor = CMTimeAdd(replayTarget.start, replayTarget.duration)
+      }
     }
 
     let rest = duration - end
     if rest > 0.05 {
-      cursor = try append(
+      cursor = try appendAround(
         video: video,
         audio: audio,
         compositionVideo: compositionVideo,
@@ -146,7 +197,8 @@ enum ClipTimeline {
         sourceStart: sourceTime(end, base: sourceStart),
         length: seconds(rest),
         at: cursor,
-        includeAudio: true
+        includeAudio: true,
+        skip: skip
       )
     }
 
@@ -157,6 +209,78 @@ enum ClipTimeline {
       duration: cursor,
       replayRange: replayRange
     )
+  }
+
+  private static func appendAround(
+    video: AVAssetTrack,
+    audio: AVAssetTrack?,
+    compositionVideo: AVMutableCompositionTrack,
+    compositionAudio: AVMutableCompositionTrack?,
+    audioSpan: CMTimeRange?,
+    media: CMTimeRange,
+    sourceStart: CMTime,
+    length: CMTime,
+    at cursor: CMTime,
+    includeAudio: Bool,
+    skip: CMTimeRange?
+  ) throws -> CMTime {
+    guard let skip else {
+      return try append(
+        video: video,
+        audio: audio,
+        compositionVideo: compositionVideo,
+        compositionAudio: compositionAudio,
+        audioSpan: audioSpan,
+        media: media,
+        sourceStart: sourceStart,
+        length: length,
+        at: cursor,
+        includeAudio: includeAudio
+      )
+    }
+    var next = cursor
+    for part in parts(start: sourceStart, length: length, skip: skip) {
+      next = try append(
+        video: video,
+        audio: audio,
+        compositionVideo: compositionVideo,
+        compositionAudio: compositionAudio,
+        audioSpan: audioSpan,
+        media: media,
+        sourceStart: part.0,
+        length: part.1,
+        at: next,
+        includeAudio: includeAudio
+      )
+    }
+    return next
+  }
+
+  private static func parts(start: CMTime, length: CMTime, skip: CMTimeRange) -> [(CMTime, CMTime)] {
+    let requested = CMTimeRange(start: start, duration: length)
+    guard requested.isValid, requested.duration.isValid, requested.duration.seconds > 0.001 else {
+      return []
+    }
+    let hole = skip.intersection(requested)
+    guard hole.isValid, hole.duration.isValid, hole.duration.seconds > 0.001 else {
+      return [(start, length)]
+    }
+    var pieces: [(CMTime, CMTime)] = []
+    if CMTimeCompare(hole.start, requested.start) > 0 {
+      let left = CMTimeSubtract(hole.start, requested.start)
+      if left.seconds > 0.001 {
+        pieces.append((requested.start, left))
+      }
+    }
+    let holeEnd = CMTimeAdd(hole.start, hole.duration)
+    let requestedEnd = CMTimeAdd(requested.start, requested.duration)
+    if CMTimeCompare(requestedEnd, holeEnd) > 0 {
+      let right = CMTimeSubtract(requestedEnd, holeEnd)
+      if right.seconds > 0.001 {
+        pieces.append((holeEnd, right))
+      }
+    }
+    return pieces
   }
 
   private static func append(

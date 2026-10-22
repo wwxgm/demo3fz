@@ -13,6 +13,7 @@ import {
 } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { CropNorm } from './runtime';
+import { applyGrip, CropGrip, normalizeCrop, setCropHeight, setCropWidth } from './cropMath';
 import { useTheme, type Palette } from './theme';
 
 type Props = {
@@ -24,8 +25,6 @@ type Props = {
 
 type Box = { x: number; y: number; w: number; h: number };
 
-const MIN_NORM = 0.08;
-
 function contain(containerW: number, containerH: number, imageW: number, imageH: number): Box {
   if (containerW <= 0 || containerH <= 0 || imageW <= 0 || imageH <= 0) {
     return { x: 0, y: 0, w: containerW, h: containerH };
@@ -36,25 +35,16 @@ function contain(containerW: number, containerH: number, imageW: number, imageH:
   return { x: (containerW - w) / 2, y: (containerH - h) / 2, w, h };
 }
 
-function clampCrop(crop: CropNorm): CropNorm {
-  const width = Math.min(Math.max(crop.width, MIN_NORM), 1);
-  const height = Math.min(Math.max(crop.height, MIN_NORM), 1);
-  const x = Math.min(Math.max(crop.x, 0), 1 - width);
-  const y = Math.min(Math.max(crop.y, 0), 1 - height);
-  return { x, y, width, height };
-}
-
 export function CropEditor({ uri, initial, onCancel, onConfirm }: Props) {
   const insets = useSafeAreaInsets();
   const { color: accent, palette } = useTheme();
-  const styles = useMemo(() => createCropStyles(palette, accent), [palette, accent]);
+  const styles = useMemo(() => createCropStyles(palette), [palette]);
   const [pixel, setPixel] = useState({ width: 0, height: 0 });
   const [stage, setStage] = useState({ width: 0, height: 0 });
-  const [crop, setCrop] = useState<CropNorm>(initial ?? { x: 0.1, y: 0.1, width: 0.8, height: 0.8 });
+  const [crop, setCrop] = useState<CropNorm>(normalizeCrop(initial ?? { x: 0.1, y: 0.1, width: 0.8, height: 0.8 }));
   const [widthText, setWidthText] = useState('');
   const [heightText, setHeightText] = useState('');
   const cropRef = useRef(crop);
-  const dragStart = useRef(crop);
   const fittedRef = useRef<Box>({ x: 0, y: 0, w: 1, h: 1 });
   cropRef.current = crop;
 
@@ -85,47 +75,26 @@ export function CropEditor({ uri, initial, onCancel, onConfirm }: Props) {
   );
   fittedRef.current = fitted;
 
-  const moveResponder = useRef(
-    PanResponder.create({
-      onStartShouldSetPanResponder: () => true,
-      onPanResponderGrant: () => {
-        dragStart.current = { ...cropRef.current };
+  const gripStart = useRef(crop);
+  const grips = useRef(
+    (['left', 'right', 'top', 'bottom', 'tl', 'tr', 'bl', 'br'] as CropGrip[]).reduce(
+      (map, grip) => {
+        map[grip] = PanResponder.create({
+          onStartShouldSetPanResponder: () => true,
+          onMoveShouldSetPanResponder: () => true,
+          onPanResponderTerminationRequest: () => false,
+          onPanResponderGrant: () => {
+            gripStart.current = { ...cropRef.current };
+          },
+          onPanResponderMove: (_, gesture) => {
+            const frame = fittedRef.current;
+            setCrop(applyGrip(gripStart.current, grip, gesture.dx, gesture.dy, frame.w, frame.h));
+          },
+        });
+        return map;
       },
-      onPanResponderMove: (_, gesture) => {
-        const frame = fittedRef.current;
-        const start = dragStart.current;
-        if (frame.w <= 0 || frame.h <= 0) return;
-        setCrop(
-          clampCrop({
-            ...start,
-            x: start.x + gesture.dx / frame.w,
-            y: start.y + gesture.dy / frame.h,
-          }),
-        );
-      },
-    }),
-  ).current;
-
-  const resizeStart = useRef(crop);
-  const resizeResponder = useRef(
-    PanResponder.create({
-      onStartShouldSetPanResponder: () => true,
-      onPanResponderGrant: () => {
-        resizeStart.current = { ...cropRef.current };
-      },
-      onPanResponderMove: (_, gesture) => {
-        const frame = fittedRef.current;
-        const start = resizeStart.current;
-        if (frame.w <= 0 || frame.h <= 0) return;
-        setCrop(
-          clampCrop({
-            ...start,
-            width: start.width + gesture.dx / frame.w,
-            height: start.height + gesture.dy / frame.h,
-          }),
-        );
-      },
-    }),
+      {} as Record<CropGrip, ReturnType<typeof PanResponder.create>>,
+    ),
   ).current;
 
   const cropStyle = {
@@ -138,13 +107,13 @@ export function CropEditor({ uri, initial, onCancel, onConfirm }: Props) {
   const commitWidth = () => {
     const next = Number(widthText);
     if (!pixel.width || !Number.isFinite(next)) return;
-    setCrop(clampCrop({ ...cropRef.current, width: next / pixel.width }));
+    setCrop(setCropWidth(cropRef.current, next / pixel.width));
   };
 
   const commitHeight = () => {
     const next = Number(heightText);
     if (!pixel.height || !Number.isFinite(next)) return;
-    setCrop(clampCrop({ ...cropRef.current, height: next / pixel.height }));
+    setCrop(setCropHeight(cropRef.current, next / pixel.height));
   };
 
   return (
@@ -154,7 +123,7 @@ export function CropEditor({ uri, initial, onCancel, onConfirm }: Props) {
         behavior={Platform.OS === 'ios' ? 'padding' : undefined}
       >
         <Text style={styles.title}>自定义裁剪</Text>
-        <Text style={styles.hint}>拖动选区，右下角可改大小。批量时按这张图的比例应用到其他已选图片。</Text>
+        <Text style={styles.hint}>拖上、下、左、右，只移动这一条边。拖角落时，对角保持不动。</Text>
         <View
           style={styles.stage}
           onLayout={(event) => {
@@ -164,13 +133,43 @@ export function CropEditor({ uri, initial, onCancel, onConfirm }: Props) {
         >
           <Image source={{ uri }} style={styles.image} resizeMode="contain" />
           {fitted.w > 0 ? (
-            <View style={[styles.crop, cropStyle]} {...moveResponder.panHandlers}>
-              <View style={styles.gridV1} />
-              <View style={styles.gridV2} />
-              <View style={styles.gridH1} />
-              <View style={styles.gridH2} />
-              <View style={styles.handle} {...resizeResponder.panHandlers} />
-            </View>
+            <>
+              <View pointerEvents="none" style={[styles.shade, { top: 0, left: 0, right: 0, height: Math.max(cropStyle.top, 0) }]} />
+              <View
+                pointerEvents="none"
+                style={[styles.shade, { top: cropStyle.top + cropStyle.height, left: 0, right: 0, bottom: 0 }]}
+              />
+              <View
+                pointerEvents="none"
+                style={[styles.shade, { top: cropStyle.top, left: 0, width: Math.max(cropStyle.left, 0), height: cropStyle.height }]}
+              />
+              <View
+                pointerEvents="none"
+                style={[styles.shade, { top: cropStyle.top, left: cropStyle.left + cropStyle.width, right: 0, height: cropStyle.height }]}
+              />
+              <View style={[styles.crop, cropStyle]} pointerEvents="box-none">
+                <View pointerEvents="none" style={styles.gridV1} />
+                <View pointerEvents="none" style={styles.gridV2} />
+                <View pointerEvents="none" style={styles.gridH1} />
+                <View pointerEvents="none" style={styles.gridH2} />
+                <View style={styles.edgeLeft} {...grips.left.panHandlers}>
+                  <View style={styles.edgeBarV} />
+                </View>
+                <View style={styles.edgeRight} {...grips.right.panHandlers}>
+                  <View style={styles.edgeBarV} />
+                </View>
+                <View style={styles.edgeTop} {...grips.top.panHandlers}>
+                  <View style={styles.edgeBarH} />
+                </View>
+                <View style={styles.edgeBottom} {...grips.bottom.panHandlers}>
+                  <View style={styles.edgeBarH} />
+                </View>
+                <View style={[styles.corner, styles.cornerTL]} {...grips.tl.panHandlers} />
+                <View style={[styles.corner, styles.cornerTR]} {...grips.tr.panHandlers} />
+                <View style={[styles.corner, styles.cornerBL]} {...grips.bl.panHandlers} />
+                <View style={[styles.corner, styles.cornerBR]} {...grips.br.panHandlers} />
+              </View>
+            </>
           ) : null}
         </View>
         <View style={styles.sizes}>
@@ -200,7 +199,7 @@ export function CropEditor({ uri, initial, onCancel, onConfirm }: Props) {
           <Pressable style={styles.secondary} onPress={onCancel}>
             <Text style={styles.secondaryText}>取消</Text>
           </Pressable>
-          <Pressable style={[styles.primary, { backgroundColor: accent }]} onPress={() => onConfirm(clampCrop(cropRef.current))}>
+          <Pressable style={[styles.primary, { backgroundColor: accent }]} onPress={() => onConfirm(normalizeCrop(cropRef.current))}>
             <Text style={styles.primaryText}>使用这个裁剪</Text>
           </Pressable>
         </View>
@@ -209,7 +208,7 @@ export function CropEditor({ uri, initial, onCancel, onConfirm }: Props) {
   );
 }
 
-function createCropStyles(palette: Palette, accent: string) {
+function createCropStyles(palette: Palette) {
   return StyleSheet.create({
   screen: {
     flex: 1,
@@ -231,7 +230,7 @@ function createCropStyles(palette: Palette, accent: string) {
     flex: 1,
     marginTop: 12,
     borderRadius: 12,
-    overflow: 'hidden',
+    overflow: 'visible',
     backgroundColor: palette.bar,
   },
   image: {
@@ -275,16 +274,87 @@ function createCropStyles(palette: Palette, accent: string) {
     height: 1,
     backgroundColor: 'rgba(255,255,255,0.45)',
   },
-  handle: {
+  shade: {
     position: 'absolute',
-    right: 4,
-    bottom: 4,
-    width: 28,
+    backgroundColor: 'rgba(0,0,0,0.45)',
+  },
+  edgeLeft: {
+    position: 'absolute',
+    left: -18,
+    top: 16,
+    bottom: 16,
+    width: 36,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  edgeRight: {
+    position: 'absolute',
+    right: -18,
+    top: 16,
+    bottom: 16,
+    width: 36,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  edgeTop: {
+    position: 'absolute',
+    top: -18,
+    left: 16,
+    right: 16,
+    height: 36,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  edgeBottom: {
+    position: 'absolute',
+    bottom: -18,
+    left: 16,
+    right: 16,
+    height: 36,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  edgeBarV: {
+    width: 4,
     height: 28,
-    borderRadius: 14,
-    backgroundColor: accent,
-    borderWidth: 2,
-    borderColor: '#F4F7FB',
+    borderRadius: 2,
+    backgroundColor: '#FFFFFF',
+  },
+  edgeBarH: {
+    width: 28,
+    height: 4,
+    borderRadius: 2,
+    backgroundColor: '#FFFFFF',
+  },
+  corner: {
+    position: 'absolute',
+    width: 22,
+    height: 22,
+    borderColor: '#FFFFFF',
+  },
+  cornerTL: {
+    left: -2,
+    top: -2,
+    borderLeftWidth: 3,
+    borderTopWidth: 3,
+  },
+  cornerTR: {
+    right: -2,
+    top: -2,
+    borderRightWidth: 3,
+    borderTopWidth: 3,
+  },
+  cornerBL: {
+    left: -2,
+    bottom: -2,
+    borderLeftWidth: 3,
+    borderBottomWidth: 3,
+  },
+  cornerBR: {
+    right: -2,
+    bottom: -2,
+    borderRightWidth: 3,
+    borderBottomWidth: 3,
   },
   sizes: {
     marginTop: 12,

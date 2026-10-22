@@ -91,7 +91,7 @@ export function MergeScreen({ onClose }: { onClose: () => void }) {
       const result = await DocumentPicker.getDocumentAsync({
         type: ['video/*', 'public.movie', 'public.mpeg-4'],
         multiple: true,
-        copyToCacheDirectory: true,
+        copyToCacheDirectory: false,
       });
       if (result.canceled) return;
       const next: Clip[] = [];

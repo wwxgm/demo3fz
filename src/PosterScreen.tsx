@@ -7,6 +7,7 @@ import {
   Pressable,
   ScrollView,
   StyleSheet,
+  Switch,
   Text,
   TextInput,
   View,
@@ -27,10 +28,25 @@ const SAMPLE_SCRIPT = `全网汉堡前五排行榜！看看有没有你的本命
 第1名 塔斯汀香辣鸡腿堡｜国产汉堡黑马！现烤中国饼皮，有嚼劲，刚出炉香到上头！`;
 
 const VIDEO_EXT = /\.(mp4|mov|m4v|avi|mkv|webm|3gp|mpeg|mpg)$/i;
+const IMAGE_EXT = /\.(jpg|jpeg|png|heic|heif|webp|gif|bmp)$/i;
+
+type BackgroundKind = 'image' | 'video';
+
+type PosterBackground = {
+  id: string;
+  uri: string;
+  name: string;
+  kind: BackgroundKind;
+};
 
 function isVideo(name: string, mimeType?: string | null) {
   if (mimeType?.startsWith('video/')) return true;
   return VIDEO_EXT.test(name);
+}
+
+function isImage(name: string, mimeType?: string | null) {
+  if (mimeType?.startsWith('image/')) return true;
+  return IMAGE_EXT.test(name);
 }
 
 function baseName(uri: string, fallback: string) {
@@ -47,22 +63,47 @@ export function PosterScreen() {
   const { color, palette } = useTheme();
   const styles = useMemo(() => createPosterStyles(palette), [palette]);
   const [script, setScript] = useState(SAMPLE_SCRIPT);
-  const [background, setBackground] = useState<{ uri: string; name: string } | null>(null);
+  const [backgrounds, setBackgrounds] = useState<PosterBackground[]>([]);
+  const [fillBackground, setFillBackground] = useState(true);
+  const [removeMusic, setRemoveMusic] = useState(true);
   const [busy, setBusy] = useState(false);
+
+  const addBackgrounds = (next: PosterBackground[]) => {
+    if (next.length === 0) {
+      Alert.alert('没有可用背景', '请选择图片或视频。');
+      return;
+    }
+    setBackgrounds((prev) => {
+      const seen = new Set(prev.map((item) => item.uri));
+      return [...prev, ...next.filter((item) => !seen.has(item.uri))].slice(0, 12);
+    });
+  };
 
   const pickLibrary = async () => {
     if (busy) return;
     setBusy(true);
     try {
       const result = await ImagePicker.launchImageLibraryAsync({
-        mediaTypes: ['videos'],
-        allowsMultipleSelection: false,
+        mediaTypes: ['images', 'videos'],
+        allowsMultipleSelection: true,
+        selectionLimit: 12,
         videoExportPreset: ImagePicker.VideoExportPreset.Passthrough,
         preferredAssetRepresentationMode: ImagePicker.UIImagePickerPreferredAssetRepresentationMode.Current,
       });
-      if (result.canceled || !result.assets[0]) return;
-      const asset = result.assets[0];
-      setBackground({ uri: asset.uri, name: asset.fileName || baseName(asset.uri, '背景视频.mp4') });
+      if (result.canceled) return;
+      const next: PosterBackground[] = [];
+      result.assets.forEach((asset, index) => {
+        const fallback = asset.type === 'image' ? `背景图片 ${index + 1}.jpg` : `背景视频 ${index + 1}.mp4`;
+        const name = asset.fileName || baseName(asset.uri, fallback);
+        const kind: BackgroundKind | null = asset.type === 'image' || asset.type === 'livePhoto' || isImage(name, asset.mimeType)
+          ? 'image'
+          : asset.type === 'video' || asset.type === 'pairedVideo' || isVideo(name, asset.mimeType)
+            ? 'video'
+            : null;
+        if (!kind) return;
+        next.push({ id: `${Date.now()}-lib-${index}-${name}`, uri: asset.uri, name, kind });
+      });
+      addBackgrounds(next);
     } catch (error) {
       Alert.alert('无法打开相册', errorText(error));
     } finally {
@@ -75,17 +116,22 @@ export function PosterScreen() {
     setBusy(true);
     try {
       const result = await DocumentPicker.getDocumentAsync({
-        type: ['video/*', 'public.movie', 'public.mpeg-4'],
-        multiple: false,
-        copyToCacheDirectory: true,
+        type: ['video/*', 'public.movie', 'public.mpeg-4', 'image/*', 'public.image'],
+        multiple: true,
+        copyToCacheDirectory: false,
       });
-      if (result.canceled || !result.assets[0]) return;
-      const asset = result.assets[0];
-      if (!isVideo(asset.name, asset.mimeType)) {
-        Alert.alert('不是视频', '请选择一个背景视频。');
-        return;
-      }
-      setBackground({ uri: asset.uri, name: asset.name });
+      if (result.canceled) return;
+      const next: PosterBackground[] = [];
+      result.assets.forEach((asset, index) => {
+        const kind: BackgroundKind | null = isImage(asset.name, asset.mimeType)
+          ? 'image'
+          : isVideo(asset.name, asset.mimeType)
+            ? 'video'
+            : null;
+        if (!kind) return;
+        next.push({ id: `${Date.now()}-file-${index}-${asset.name}`, uri: asset.uri, name: asset.name, kind });
+      });
+      addBackgrounds(next);
     } catch (error) {
       Alert.alert('无法打开文件', errorText(error));
     } finally {
@@ -116,7 +162,15 @@ export function PosterScreen() {
     setBusy(true);
     let output = '';
     try {
-      output = await VideoFlip.makePoster(text, background?.uri ?? '');
+      const onlyVideo = backgrounds.length === 1 && backgrounds[0].kind === 'video' ? backgrounds[0].uri : '';
+      output = await VideoFlip.makePoster(text, onlyVideo, {
+        fill: fillBackground,
+        mute: removeMusic,
+        backgrounds:
+          backgrounds.length > 1 || backgrounds.some((item) => item.kind === 'image')
+            ? backgrounds.map((item) => ({ uri: item.uri, kind: item.kind }))
+            : undefined,
+      });
       await MediaLibrary.createAssetAsync(output);
       Alert.alert('已保存', '大字报视频已保存到相册。');
     } catch (error) {
@@ -141,7 +195,29 @@ export function PosterScreen() {
           editable={!busy}
           style={styles.script}
         />
-        <Text style={styles.hint}>标题先出现，然后从第 5 名播到第 1 名。竖线后面是介绍。有背景视频时按原速播放。</Text>
+        <Text style={styles.hint}>标题先出现，然后从第 5 名播到第 1 名。竖线后面是介绍。</Text>
+        <View style={styles.optionRow}>
+          <Text style={styles.optionLabel}>背景铺满文案</Text>
+          <Switch
+            disabled={busy}
+            value={fillBackground}
+            onValueChange={setFillBackground}
+            trackColor={{ false: palette.switchOff, true: color }}
+          />
+        </View>
+        <Text style={styles.hint}>
+          只有一段背景视频时，打开后会放慢、重复并慢慢放大，直到和文案一样长；关掉则按原速，文案会被截断。多张图片会慢慢放大再还原，并和前后背景渐变切换。视频不够长会自动延长。
+        </Text>
+        <View style={styles.optionRow}>
+          <Text style={styles.optionLabel}>移除背景音乐</Text>
+          <Switch
+            disabled={busy}
+            value={removeMusic}
+            onValueChange={setRemoveMusic}
+            trackColor={{ false: palette.switchOff, true: color }}
+          />
+        </View>
+        <Text style={styles.hint}>默认去掉背景里的声音。关掉后保留原背景音乐。</Text>
         <View style={styles.actions}>
           <Pressable style={styles.secondary} disabled={busy} onPress={() => void pickLibrary()}>
             <Text style={styles.secondaryText}>相册背景</Text>
@@ -152,14 +228,26 @@ export function PosterScreen() {
         </View>
         <View style={styles.backgroundRow}>
           <Text style={styles.hint} numberOfLines={2}>
-            {background ? `背景：${background.name}` : '当前没有背景视频'}
+            {backgrounds.length > 0 ? `已加 ${backgrounds.length} 个背景` : '当前没有背景'}
           </Text>
-          {background && !busy ? (
-            <Pressable onPress={() => setBackground(null)} hitSlop={8}>
-              <Text style={styles.remove}>清除</Text>
+          {backgrounds.length > 0 && !busy ? (
+            <Pressable onPress={() => setBackgrounds([])} hitSlop={8}>
+              <Text style={styles.remove}>清空</Text>
             </Pressable>
           ) : null}
         </View>
+        {backgrounds.map((item, index) => (
+          <View key={item.id} style={styles.backgroundRow}>
+            <Text style={styles.hint} numberOfLines={1}>
+              {index + 1}. {item.kind === 'image' ? '图片' : '视频'} · {item.name}
+            </Text>
+            {!busy ? (
+              <Pressable onPress={() => setBackgrounds((prev) => prev.filter((it) => it.id !== item.id))} hitSlop={8}>
+                <Text style={styles.remove}>移除</Text>
+              </Pressable>
+            ) : null}
+          </View>
+        ))}
       </ScrollView>
       <Pressable style={[styles.primary, { backgroundColor: color }, busy && styles.primaryDisabled]} disabled={busy} onPress={() => void make()}>
         {busy ? <ActivityIndicator color="#F4F7FB" /> : <Text style={styles.primaryText}>制作并保存</Text>}
@@ -231,6 +319,17 @@ function createPosterStyles(palette: Palette) {
     flexDirection: 'row',
     alignItems: 'center',
     gap: 12,
+  },
+  optionRow: {
+    minHeight: 40,
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+  },
+  optionLabel: {
+    color: palette.text,
+    fontSize: 15,
+    fontWeight: '600',
   },
   remove: {
     color: '#F0A8A8',

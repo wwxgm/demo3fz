@@ -37,14 +37,35 @@ export type VideoProcessOptions = {
     mode: HighlightMode;
   };
   filter?: VideoFilter;
+  cut?: {
+    start: number;
+    end: number;
+  };
 };
 
 type VideoFlipNative = {
   flipHorizontal(uri: string, options: VideoProcessOptions): Promise<string>;
   processImage(uri: string, options: ImageProcessOptions): Promise<string>;
   sampleFrames(uri: string, count: number): Promise<string[]>;
+  frameAt(uri: string, seconds: number): Promise<string>;
+  coverSmear(uri: string, options: {
+    regions: {
+      x: number;
+      y: number;
+      width: number;
+      height: number;
+      direction: 'horizontal' | 'vertical';
+      start: number;
+      end: number;
+    }[];
+  }): Promise<string>;
   joinVideos(uris: string[]): Promise<string>;
-  makePoster(script: string, backgroundUri: string): Promise<string>;
+  makePoster(script: string, backgroundUri: string, options?: {
+    fill?: boolean;
+    mute?: boolean;
+    backgrounds?: { uri: string; kind: 'image' | 'video' }[];
+  }): Promise<string>;
+  loadPage(url: string, referer: string): Promise<string>;
   removeTempFile(uri: string): void;
   clearProcessingCache(): number;
 };
@@ -61,10 +82,19 @@ const missing: VideoFlipNative = {
   async sampleFrames() {
     throw new Error(missingMessage);
   },
+  async frameAt() {
+    throw new Error(missingMessage);
+  },
+  async coverSmear() {
+    throw new Error(missingMessage);
+  },
   async joinVideos() {
     throw new Error(missingMessage);
   },
   async makePoster() {
+    throw new Error(missingMessage);
+  },
+  async loadPage() {
     throw new Error(missingMessage);
   },
   removeTempFile() {},

@@ -331,7 +331,15 @@ enum ImageMark {
       }
       var request = URLRequest(url: remote)
       request.timeoutInterval = 60
-      request.setValue("VideoFlip/1.2", forHTTPHeaderField: "User-Agent")
+      request.setValue(
+        "Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Mobile/15E148 Safari/604.1",
+        forHTTPHeaderField: "User-Agent"
+      )
+      request.setValue("zh-CN,zh;q=0.9", forHTTPHeaderField: "Accept-Language")
+      if let host = remote.host?.lowercased(),
+         host.contains("baidu") || host.contains("bdimg") || host.contains("bdstatic") {
+        request.setValue("https://image.baidu.com/", forHTTPHeaderField: "Referer")
+      }
       let fileURL: URL
       let response: URLResponse
       do {
@@ -522,5 +530,41 @@ enum ImageMark {
       throw ImageMarkError.exportFailed
     }
     return urls
+  }
+
+  static func frameAt(uri: String, seconds: Double) async throws -> String {
+    let url = try resolve(uri.trimmingCharacters(in: .whitespacesAndNewlines))
+    let accessed = url.startAccessingSecurityScopedResource()
+    defer {
+      if accessed {
+        url.stopAccessingSecurityScopedResource()
+      }
+    }
+    guard FileManager.default.fileExists(atPath: url.path) else {
+      throw ImageMarkError.badSource
+    }
+    let asset = AVURLAsset(url: url)
+    let duration = try await asset.load(.duration).seconds
+    guard duration.isFinite, duration > 0.2 else {
+      throw ImageMarkError.unreadable
+    }
+    let generator = AVAssetImageGenerator(asset: asset)
+    generator.appliesPreferredTrackTransform = true
+    generator.maximumSize = CGSize(width: 1280, height: 1280)
+    generator.requestedTimeToleranceBefore = CMTime(seconds: 0.2, preferredTimescale: 600)
+    generator.requestedTimeToleranceAfter = CMTime(seconds: 0.2, preferredTimescale: 600)
+    let time = min(max(seconds, 0.05), max(duration - 0.05, 0.05))
+    let image: CGImage
+    do {
+      image = try generator.copyCGImage(at: CMTime(seconds: time, preferredTimescale: 600), actualTime: nil)
+    } catch {
+      throw ImageMarkError.unreadable
+    }
+    guard let data = UIImage(cgImage: image).jpegData(compressionQuality: 0.86) else {
+      throw ImageMarkError.exportFailed
+    }
+    let output = FileManager.default.temporaryDirectory.appendingPathComponent("frame-\(UUID().uuidString).jpg")
+    try data.write(to: output, options: .atomic)
+    return output.absoluteString
   }
 }

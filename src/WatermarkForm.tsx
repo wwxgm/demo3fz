@@ -6,18 +6,21 @@ import { useTheme, type Palette } from './theme';
 type Props = {
   value: WatermarkSettings;
   onChange: (next: WatermarkSettings) => void;
+  embedded?: boolean;
+  disabled?: boolean;
 };
 
-export function WatermarkForm({ value, onChange }: Props) {
+export function WatermarkForm({ value, onChange, embedded, disabled }: Props) {
   const { color: accent, palette } = useTheme();
   const styles = useMemo(() => createWatermarkStyles(palette), [palette]);
   const patch = (part: Partial<WatermarkSettings>) => onChange({ ...value, ...part });
 
   return (
-    <View style={styles.box}>
+    <View style={[styles.box, embedded && styles.embedded]}>
       <View style={styles.row}>
         <Text style={styles.label}>添加水印</Text>
         <Switch
+          disabled={disabled}
           value={value.enabled}
           onValueChange={(enabled) => patch({ enabled })}
           trackColor={{ false: palette.switchOff, true: accent }}
@@ -28,6 +31,7 @@ export function WatermarkForm({ value, onChange }: Props) {
           <TextInput
             value={value.text}
             onChangeText={(text) => patch({ text })}
+            editable={!disabled}
             placeholder="南方小猴子"
             placeholderTextColor={palette.placeholder}
             style={styles.input}
@@ -35,18 +39,21 @@ export function WatermarkForm({ value, onChange }: Props) {
           <Stepper
             label="字号"
             value={String(value.fontSize)}
+            disabled={disabled}
             onMinus={() => patch({ fontSize: Math.max(12, value.fontSize - 2) })}
             onPlus={() => patch({ fontSize: Math.min(48, value.fontSize + 2) })}
           />
           <Stepper
             label="透明度"
             value={`${Math.round(value.opacity * 100)}%`}
+            disabled={disabled}
             onMinus={() => patch({ opacity: Math.max(0.1, Number((value.opacity - 0.05).toFixed(2))) })}
             onPlus={() => patch({ opacity: Math.min(0.5, Number((value.opacity + 0.05).toFixed(2))) })}
           />
           <View style={styles.row}>
             <Text style={styles.sub}>轻微移动</Text>
             <Switch
+              disabled={disabled}
               value={value.move}
               onValueChange={(move) => patch({ move })}
               trackColor={{ false: palette.switchOff, true: accent }}
@@ -55,6 +62,7 @@ export function WatermarkForm({ value, onChange }: Props) {
           <View style={styles.row}>
             <Text style={styles.sub}>左边</Text>
             <Switch
+              disabled={disabled}
               value={value.placeLeft}
               onValueChange={(placeLeft) => patch({ placeLeft })}
               trackColor={{ false: palette.switchOff, true: accent }}
@@ -63,6 +71,7 @@ export function WatermarkForm({ value, onChange }: Props) {
           <View style={styles.row}>
             <Text style={styles.sub}>中央</Text>
             <Switch
+              disabled={disabled}
               value={value.placeCenter}
               onValueChange={(placeCenter) => patch({ placeCenter })}
               trackColor={{ false: palette.switchOff, true: accent }}
@@ -78,11 +87,13 @@ export function WatermarkForm({ value, onChange }: Props) {
 function Stepper({
   label,
   value,
+  disabled,
   onMinus,
   onPlus,
 }: {
   label: string;
   value: string;
+  disabled?: boolean;
   onMinus: () => void;
   onPlus: () => void;
 }) {
@@ -92,11 +103,11 @@ function Stepper({
     <View style={styles.row}>
       <Text style={styles.sub}>{label}</Text>
       <View style={styles.stepper}>
-        <Pressable onPress={onMinus} style={styles.step}>
+        <Pressable disabled={disabled} onPress={onMinus} style={styles.step}>
           <Text style={styles.stepText}>-</Text>
         </Pressable>
         <Text style={styles.stepValue}>{value}</Text>
-        <Pressable onPress={onPlus} style={styles.step}>
+        <Pressable disabled={disabled} onPress={onPlus} style={styles.step}>
           <Text style={styles.stepText}>+</Text>
         </Pressable>
       </View>
@@ -114,6 +125,13 @@ function createWatermarkStyles(palette: Palette) {
     borderColor: palette.line,
     paddingHorizontal: 12,
     paddingVertical: 8,
+  },
+  embedded: {
+    marginTop: 4,
+    borderWidth: 0,
+    backgroundColor: 'transparent',
+    paddingHorizontal: 0,
+    paddingVertical: 0,
   },
   fields: {
     gap: 8,

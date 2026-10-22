@@ -2,7 +2,7 @@
   "expo": {
     "name": "IphoneHello",
     "slug": "iphone-hello",
-    "version": "1.7.3",
+    "version": "1.7.4",
     "orientation": "portrait",
     "icon": "./assets/icon.png",
     "userInterfaceStyle": "light",
@@ -15,7 +15,7 @@
     "ios": {
       "supportsTablet": false,
       "bundleIdentifier": "com.local.iphonehello",
-      "buildNumber": "11",
+      "buildNumber": "12",
       "infoPlist": {
         "CFBundleDisplayName": "视频翻转",
         "NSPhotoLibraryUsageDescription": "需要访问相册，以选择图片或视频，并把处理后的文件保存到相册。",

@@ -19,6 +19,7 @@ import * as MediaLibrary from 'expo-media-library';
 import VideoFlip from '../modules/video-flip';
 import { CropEditor } from './CropEditor';
 import { MergeScreen } from './MergeScreen';
+import { SmearScreen } from './SmearScreen';
 import { WatermarkForm } from './WatermarkForm';
 import { useTheme, type Palette } from './theme';
 import {
@@ -43,6 +44,10 @@ type MediaItem = {
   source: '相册' | '文件';
   status: ItemStatus;
   message?: string;
+  subtitle?: string;
+  filter?: 'vivid' | 'warm' | 'cool' | 'mono';
+  watermark?: WatermarkSettings;
+  cut?: { start: string; end: string };
 };
 
 const VIDEO_EXT = /\.(mp4|mov|m4v|avi|mkv|webm|3gp|mpeg|mpg)$/i;
@@ -73,6 +78,14 @@ function formatSize(size?: number) {
   return `${(size / (1024 * 1024)).toFixed(1)} MB`;
 }
 
+const FILTERS = [
+  ['', '无'],
+  ['vivid', '鲜艳'],
+  ['warm', '暖色'],
+  ['cool', '冷色'],
+  ['mono', '黑白'],
+] as const;
+
 function formatDuration(durationMs?: number) {
   if (!durationMs || durationMs <= 0) return '';
   const total = Math.round(durationMs / 1000);
@@ -90,18 +103,16 @@ export function MediaScreen() {
   const [images, setImages] = useState<MediaItem[]>([]);
   const [watermark, setWatermark] = useState<WatermarkSettings>(defaultWatermark);
   const [zoom, setZoom] = useState(1);
-  const [subtitleScript, setSubtitleScript] = useState('');
   const [useCurrentClip, setUseCurrentClip] = useState(true);
   const [extendVideo, setExtendVideo] = useState(false);
   const [clipStart, setClipStart] = useState('3');
   const [clipEnd, setClipEnd] = useState('6');
   const [freezeSeconds, setFreezeSeconds] = useState('6');
   const [highlightMode, setHighlightMode] = useState<'normal' | 'slow' | 'slowZoom'>('normal');
-  const [filterOn, setFilterOn] = useState(false);
-  const [filterName, setFilterName] = useState<'vivid' | 'warm' | 'cool' | 'mono'>('vivid');
   const [followOn, setFollowOn] = useState(false);
   const [followClip, setFollowClip] = useState<{ uri: string; name: string } | null>(null);
   const [mergeOpen, setMergeOpen] = useState(false);
+  const [smearOpen, setSmearOpen] = useState(false);
   const [flipImages, setFlipImages] = useState(false);
   const [crop, setCrop] = useState<CropNorm | null>(null);
   const [cropSampleId, setCropSampleId] = useState<string | null>(null);
@@ -178,13 +189,17 @@ export function MediaScreen() {
   const pickFromFiles = async () => {
     if (busy) return;
     setPicking(true);
+    setSummary('正在打开文件。放在 iCloud 里的视频要先下载，所以会比相册慢。');
     try {
       const result = await DocumentPicker.getDocumentAsync({
         type: kind === 'video' ? ['video/*', 'public.movie', 'public.mpeg-4'] : ['image/*', 'public.image'],
         multiple: true,
-        copyToCacheDirectory: true,
+        copyToCacheDirectory: false,
       });
-      if (result.canceled) return;
+      if (result.canceled) {
+        setSummary('');
+        return;
+      }
       const next: MediaItem[] = [];
       result.assets.forEach((asset, index) => {
         const matched = kind === 'video' ? isVideo(asset.name, asset.mimeType) : isImage(asset.name, asset.mimeType);
@@ -199,6 +214,7 @@ export function MediaScreen() {
         });
       });
       addItems(next, kind);
+      setSummary('');
     } catch (error) {
       Alert.alert('无法打开文件', errorText(error));
     } finally {
@@ -218,8 +234,13 @@ export function MediaScreen() {
   };
 
   const validateWatermark = () => {
-    if (!watermark.enabled) return true;
-    if (!watermark.placeLeft && !watermark.placeCenter) {
+    const marks =
+      kind === 'video'
+        ? videos.flatMap((item) => (item.watermark?.enabled ? [item.watermark] : []))
+        : watermark.enabled
+          ? [watermark]
+          : [];
+    if (marks.some((mark) => !mark.placeLeft && !mark.placeCenter)) {
       Alert.alert('请选择水印位置', '左边或中央至少打开一个。');
       return false;
     }
@@ -250,10 +271,33 @@ export function MediaScreen() {
         Alert.alert('请检查延长时间', '开始要小于结束，定格至少 0.5 秒。');
         return;
       }
+      const tooShort = queue.find((item) => item.durationMs && item.durationMs > 0 && item.durationMs / 1000 + 0.08 < end);
+      if (tooShort) {
+        Alert.alert('视频不够长', `${tooShort.name} 短于结束时间 ${end} 秒，无法按这个时间延长。`);
+        return;
+      }
     }
     if (kind === 'video' && followOn && !followClip) {
       Alert.alert('还没有关注片段', '请先上传末尾要接上的视频，或关掉这个开关。');
       return;
+    }
+    if (kind === 'video') {
+      const invalidCut = queue.find((item) => {
+        if (!item.cut) return false;
+        const start = Number(item.cut.start);
+        const end = Number(item.cut.end);
+        if (!Number.isFinite(start) || !Number.isFinite(end) || start < 0 || end <= start + 0.04) return true;
+        if (item.durationMs && item.durationMs > 0) {
+          const seconds = item.durationMs / 1000;
+          if (start >= seconds - 0.04) return true;
+          if (seconds - (Math.min(end, seconds) - start) <= 0.2) return true;
+        }
+        return false;
+      });
+      if (invalidCut) {
+        Alert.alert('请检查移除时间', `${invalidCut.name} 的开始要小于结束，并且不能把整段都剪掉。`);
+        return;
+      }
     }
     if (kind === 'image' && !flipImages && !watermark.enabled && !crop) {
       Alert.alert('还没有处理项', '请勾选水平翻转、水印，或先设置裁剪。');
@@ -264,12 +308,13 @@ export function MediaScreen() {
 
     const heavy =
       kind === 'video' &&
-      (watermark.enabled ||
-        filterOn ||
-        extendVideo ||
+      (extendVideo ||
         followOn ||
         zoom > 1 ||
-        subtitleScript.trim().length > 0);
+        queue.some(
+          (item) =>
+            (item.subtitle ?? '').trim().length > 0 || Boolean(item.filter) || Boolean(item.watermark?.enabled),
+        ));
 
     setRunning(true);
     setSummary('');
@@ -277,7 +322,6 @@ export function MediaScreen() {
     let failed = 0;
     const saveNext = createSaveQueue();
     const mark = watermarkPayload(watermark);
-    const subtitleLines = subtitleScript.split(/\r?\n/);
 
     await runWithLimit(queue, kind === 'video' || heavy ? 1 : 2, async (item) => {
       setItems((prev) =>
@@ -288,9 +332,9 @@ export function MediaScreen() {
         outputUri =
           kind === 'video'
             ? await VideoFlip.flipHorizontal(item.uri, {
-                watermark: mark,
+                watermark: watermarkPayload(item.watermark ?? defaultWatermark),
                 zoom,
-                subtitle: subtitleLines[items.findIndex((it) => it.id === item.id)]?.trim() || undefined,
+                subtitle: item.subtitle?.trim() || undefined,
                 extend:
                   extendVideo && useCurrentClip
                     ? {
@@ -300,7 +344,10 @@ export function MediaScreen() {
                         mode: highlightMode,
                       }
                     : undefined,
-                filter: filterOn ? filterName : undefined,
+                filter: item.filter,
+                ...(item.cut
+                  ? { cut: { start: Number(item.cut.start), end: Number(item.cut.end) } }
+                  : {}),
               })
             : await VideoFlip.processImage(item.uri, {
                 flip: flipImages,
@@ -360,15 +407,12 @@ export function MediaScreen() {
     setVideos([]);
     setWatermark(defaultWatermark);
     setZoom(1);
-    setSubtitleScript('');
     setUseCurrentClip(true);
     setExtendVideo(false);
     setClipStart('3');
     setClipEnd('6');
     setFreezeSeconds('6');
     setHighlightMode('normal');
-    setFilterOn(false);
-    setFilterName('vivid');
     setFollowOn(false);
     setFollowClip(null);
     setSummary('');
@@ -393,7 +437,7 @@ export function MediaScreen() {
         const result = await DocumentPicker.getDocumentAsync({
           type: ['video/*', 'public.movie', 'public.mpeg-4'],
           multiple: false,
-          copyToCacheDirectory: true,
+          copyToCacheDirectory: false,
         });
         if (result.canceled || !result.assets[0]) return;
         const asset = result.assets[0];
@@ -410,6 +454,10 @@ export function MediaScreen() {
     }
   };
 
+  if (smearOpen) {
+    return <SmearScreen onClose={() => setSmearOpen(false)} />;
+  }
+
   if (mergeOpen) {
     return <MergeScreen onClose={() => setMergeOpen(false)} />;
   }
@@ -423,6 +471,9 @@ export function MediaScreen() {
             <Pressable disabled={busy} onPress={refreshVideo} hitSlop={8}>
               <Text style={styles.link}>刷新</Text>
             </Pressable>
+            <Pressable disabled={busy} onPress={() => setSmearOpen(true)} hitSlop={8}>
+              <Text style={styles.link}>去水印</Text>
+            </Pressable>
             <Pressable disabled={busy} onPress={() => setMergeOpen(true)} hitSlop={8}>
               <Text style={styles.link}>合并</Text>
             </Pressable>
@@ -431,7 +482,7 @@ export function MediaScreen() {
       </View>
       <Text style={styles.subtitle}>
         {kind === 'video'
-          ? '可多选视频，一键左右镜像。放大和字幕按批处理，水印默认关闭。'
+          ? '可多选视频，一键左右镜像。每条视频单独设置字幕、滤镜和水印。'
           : '可多选图片。翻转、水印和裁剪会一起应用到全部，并保存到相册。'}
       </Text>
       <View style={styles.segment}>
@@ -457,17 +508,8 @@ export function MediaScreen() {
                 </Pressable>
               ))}
             </View>
-            <Text style={styles.optionLabel}>解说字幕</Text>
-            <TextInput
-              value={subtitleScript}
-              onChangeText={setSubtitleScript}
-              placeholder={'一行对应一个视频\n第二行给第二个视频'}
-              placeholderTextColor={palette.placeholder}
-              multiline
-              style={styles.script}
-            />
             <Text style={styles.optionHint}>
-              空行表示该视频不加字幕。有字的视频会用系统中文男声解说，字幕和声音一起出现，原声在解说期间变小。
+              字幕、滤镜、水印和移除片段都在每条视频下面单独设置。不填写或不勾选的那一条不会做这项处理。有字幕的会用系统中文男声解说，原声在解说期间变小。
             </Text>
             <View style={styles.optionRow}>
               <Text style={styles.optionLabel}>延长视频</Text>
@@ -517,35 +559,7 @@ export function MediaScreen() {
                 </Text>
               </View>
             ) : null}
-            <View style={styles.optionRow}>
-              <Text style={styles.optionLabel}>批量滤镜</Text>
-              <Switch
-                value={filterOn}
-                onValueChange={setFilterOn}
-                trackColor={{ false: palette.switchOff, true: accent }}
-              />
-            </View>
-            {filterOn ? (
-              <View style={styles.zoomRow}>
-                {(
-                  [
-                    ['vivid', '鲜艳'],
-                    ['warm', '暖色'],
-                    ['cool', '冷色'],
-                    ['mono', '黑白'],
-                  ] as const
-                ).map(([name, label]) => (
-                  <Pressable
-                    key={name}
-                    style={[styles.zoomChip, filterName === name && styles.zoomChipOn, filterName === name && { backgroundColor: accent }]}
-                    onPress={() => setFilterName(name)}
-                  >
-                    <Text style={[styles.zoomText, filterName === name && styles.onAccentText]}>{label}</Text>
-                  </Pressable>
-                ))}
-              </View>
-            ) : null}
-            <Text style={styles.optionHint}>这些开关默认关闭。不勾选时，仍只做原来的翻转、放大和解说。</Text>
+            <Text style={styles.optionHint}>这些开关默认关闭。不勾选时只做翻转和放大。</Text>
             <View style={styles.optionRow}>
               <Text style={styles.optionLabel}>末尾关注</Text>
               <Switch
@@ -573,7 +587,7 @@ export function MediaScreen() {
             ) : null}
           </View>
         ) : null}
-        <WatermarkForm value={watermark} onChange={setWatermark} />
+        {kind === 'image' ? <WatermarkForm value={watermark} onChange={setWatermark} /> : null}
         {kind === 'image' ? (
           <View style={styles.optionCard}>
             <View style={styles.optionRow}>
@@ -643,6 +657,108 @@ export function MediaScreen() {
                     {isSample ? ' · 样板' : ''}
                   </Text>
                   {meta ? <Text style={styles.cardMeta}>{meta}</Text> : null}
+                  {kind === 'video' ? (
+                    <>
+                      <TextInput
+                        value={item.subtitle ?? ''}
+                        onChangeText={(text) =>
+                          setVideos((prev) => prev.map((it) => (it.id === item.id ? { ...it, subtitle: text } : it)))
+                        }
+                        editable={!busy}
+                        placeholder="给这条视频加字幕，留空则不加"
+                        placeholderTextColor={palette.placeholder}
+                        multiline
+                        style={styles.itemScript}
+                      />
+                      <Text style={styles.cardMeta}>滤镜</Text>
+                      <View style={styles.zoomRow}>
+                        {FILTERS.map(([name, label]) => {
+                          const selected = (item.filter ?? '') === name;
+                          return (
+                            <Pressable
+                              key={label}
+                              disabled={busy}
+                              style={[styles.zoomChip, selected && styles.zoomChipOn, selected && { backgroundColor: accent }]}
+                              onPress={() =>
+                                setVideos((prev) =>
+                                  prev.map((it) =>
+                                    it.id === item.id ? { ...it, filter: name === '' ? undefined : name } : it,
+                                  ),
+                                )
+                              }
+                            >
+                              <Text style={[styles.zoomText, selected && styles.onAccentText]}>{label}</Text>
+                            </Pressable>
+                          );
+                        })}
+                      </View>
+                      <WatermarkForm
+                        embedded
+                        disabled={busy}
+                        value={item.watermark ?? defaultWatermark}
+                        onChange={(next) =>
+                          setVideos((prev) => prev.map((it) => (it.id === item.id ? { ...it, watermark: next } : it)))
+                        }
+                      />
+                      <View style={styles.optionRow}>
+                        <Text style={styles.optionLabel}>移除片段</Text>
+                        <Switch
+                          disabled={busy}
+                          value={item.cut != null}
+                          onValueChange={(enabled) =>
+                            setVideos((prev) =>
+                              prev.map((it) =>
+                                it.id === item.id ? { ...it, cut: enabled ? { start: '', end: '' } : undefined } : it,
+                              ),
+                            )
+                          }
+                          trackColor={{ false: palette.switchOff, true: accent }}
+                        />
+                      </View>
+                      {item.cut ? (
+                        <>
+                          <View style={styles.timeRow}>
+                            <Text style={styles.optionHint}>开始</Text>
+                            <TextInput
+                              value={item.cut.start}
+                              onChangeText={(text) =>
+                                setVideos((prev) =>
+                                  prev.map((it) =>
+                                    it.id === item.id && it.cut ? { ...it, cut: { ...it.cut, start: text } } : it,
+                                  ),
+                                )
+                              }
+                              editable={!busy}
+                              keyboardType="decimal-pad"
+                              placeholder="0"
+                              placeholderTextColor={palette.placeholder}
+                              style={styles.timeInput}
+                            />
+                            <Text style={styles.optionHint}>结束</Text>
+                            <TextInput
+                              value={item.cut.end}
+                              onChangeText={(text) =>
+                                setVideos((prev) =>
+                                  prev.map((it) =>
+                                    it.id === item.id && it.cut ? { ...it, cut: { ...it.cut, end: text } } : it,
+                                  ),
+                                )
+                              }
+                              editable={!busy}
+                              keyboardType="decimal-pad"
+                              placeholder="1"
+                              placeholderTextColor={palette.placeholder}
+                              style={styles.timeInput}
+                            />
+                            <Text style={styles.optionHint}>秒</Text>
+                          </View>
+                          <Text style={styles.optionHint}>
+                            只剪掉这一条里的这一段，后面的画面往前接。关掉开关则不剪。
+                          </Text>
+                        </>
+                      ) : null}
+                    </>
+                  ) : null}
                   {item.message ? (
                     <Text
                       style={[
@@ -820,11 +936,12 @@ function createMediaStyles(palette: Palette, accent: string) {
     fontSize: 14,
     fontWeight: '700',
   },
-  script: {
-    minHeight: 88,
+  itemScript: {
+    minHeight: 64,
+    marginTop: 6,
     borderRadius: 10,
-    paddingHorizontal: 12,
-    paddingVertical: 10,
+    paddingHorizontal: 10,
+    paddingVertical: 8,
     color: palette.text,
     backgroundColor: palette.field,
     fontSize: 15,
@@ -884,7 +1001,7 @@ function createMediaStyles(palette: Palette, accent: string) {
   },
   card: {
     flexDirection: 'row',
-    alignItems: 'center',
+    alignItems: 'flex-start',
     gap: 12,
     paddingHorizontal: 14,
     paddingVertical: 12,

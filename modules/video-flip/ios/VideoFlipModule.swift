@@ -17,12 +17,24 @@ public class VideoFlipModule: Module {
       try await ImageMark.sampleFrames(uri: uri, count: count)
     }
 
+    AsyncFunction("frameAt") { (uri: String, seconds: Double) async throws -> String in
+      try await ImageMark.frameAt(uri: uri, seconds: seconds)
+    }
+
+    AsyncFunction("coverSmear") { (uri: String, options: [String: Any]) async throws -> String in
+      try await Smear.cover(uri: uri, options: options)
+    }
+
     AsyncFunction("joinVideos") { (uris: [String]) async throws -> String in
       try await Concat.join(uris: uris)
     }
 
-    AsyncFunction("makePoster") { (script: String, backgroundUri: String) async throws -> String in
-      try await PosterMaker.make(script: script, backgroundUri: backgroundUri)
+    AsyncFunction("makePoster") { (script: String, backgroundUri: String, options: [String: Any]) async throws -> String in
+      try await PosterMaker.make(script: script, backgroundUri: backgroundUri, options: options)
+    }
+
+    AsyncFunction("loadPage") { (url: String, referer: String) async throws -> String in
+      try await PageLoader.load(url: url, referer: referer)
     }
 
     Function("removeTempFile") { (uri: String) in
@@ -32,6 +44,56 @@ public class VideoFlipModule: Module {
     Function("clearProcessingCache") { () -> Double in
       VideoFlipper.clearProcessingCache()
     }
+  }
+}
+
+private enum PageLoadError: LocalizedError {
+  case message(String)
+
+  var errorDescription: String? {
+    switch self {
+    case .message(let text):
+      return text
+    }
+  }
+}
+
+private enum PageLoader {
+  static func load(url: String, referer: String) async throws -> String {
+    guard let target = URL(string: url) else {
+      throw PageLoadError.message("搜索地址无效")
+    }
+    var request = URLRequest(url: target)
+    request.timeoutInterval = 30
+    request.setValue(
+      "Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Mobile/15E148 Safari/604.1",
+      forHTTPHeaderField: "User-Agent"
+    )
+    if !referer.isEmpty {
+      request.setValue(referer, forHTTPHeaderField: "Referer")
+    }
+    request.setValue("zh-CN,zh;q=0.9", forHTTPHeaderField: "Accept-Language")
+    request.setValue("application/json,text/plain,text/html,*/*", forHTTPHeaderField: "Accept")
+    let data: Data
+    let response: URLResponse
+    do {
+      (data, response) = try await URLSession.shared.data(for: request)
+    } catch {
+      throw PageLoadError.message("没有连上搜索接口")
+    }
+    if let http = response as? HTTPURLResponse, !(200...299).contains(http.statusCode) {
+      throw PageLoadError.message("接口返回 HTTP \(http.statusCode)")
+    }
+    if let text = String(data: data, encoding: .utf8) {
+      return text
+    }
+    let gbk = String.Encoding(
+      rawValue: CFStringConvertEncodingToNSStringEncoding(CFStringEncoding(CFStringEncodings.GB_18030_2000.rawValue))
+    )
+    if let text = String(data: data, encoding: gbk) {
+      return text
+    }
+    throw PageLoadError.message("搜索结果无法读取")
   }
 }
 
@@ -87,6 +149,10 @@ private enum VideoFlipper {
     }
 
     let sourceAudio = try await asset.loadTracks(withMediaType: .audio).first
+    let cut = try Self.parseCut(options)
+    if let cut {
+      try Self.validateCut(cut, duration: sourceRange.duration.seconds)
+    }
     let extend = Self.parseExtend(options)
     let timeline: ClipTimeline.Result
     if let extend {
@@ -95,15 +161,30 @@ private enum VideoFlipper {
         audio: sourceAudio,
         sourceStart: sourceRange.start,
         sourceDuration: sourceRange.duration,
-        extend: extend
+        extend: extend,
+        skip: cut.map { Self.skipRange($0, sourceStart: sourceRange.start, duration: sourceRange.duration) }
       )
     } else {
       timeline = try await Self.plainTimeline(video: videoTrack, audio: sourceAudio, sourceRange: sourceRange)
     }
     let composition = timeline.composition
     let compositionVideoTrack = timeline.videoTrack
-    let originalAudioTrack = timeline.audioTrack
-    let timelineDuration = timeline.duration
+    var originalAudioTrack = timeline.audioTrack
+    var timelineDuration = timeline.duration
+    if extend == nil, let cut {
+      let keptAudio = try await excise(
+        composition: composition,
+        video: compositionVideoTrack,
+        audio: originalAudioTrack,
+        start: cut.start,
+        end: cut.end
+      )
+      if !keptAudio {
+        originalAudioTrack = nil
+      }
+      let updated = try await compositionVideoTrack.load(.timeRange)
+      timelineDuration = updated.duration
+    }
 
     let subtitle = Self.subtitle(from: options)
     var narrationURL: URL?
@@ -151,22 +232,22 @@ private enum VideoFlipper {
     }
 
     let composedRange = try await compositionVideoTrack.load(.timeRange)
-    var safeDuration = CMTimeMinimum(timelineDuration, composedRange.duration)
-    let oneFrame = CMTime(value: 1, timescale: 30)
-    if CMTimeCompare(safeDuration, CMTimeMultiply(oneFrame, multiplier: 3)) > 0 {
-      safeDuration = CMTimeSubtract(safeDuration, oneFrame)
-    }
+    let safeDuration = try alignToFrames(
+      video: compositionVideoTrack,
+      audios: [originalAudioTrack, speechTrack],
+      duration: CMTimeMinimum(timelineDuration, composedRange.duration)
+    )
     let instruction = AVMutableVideoCompositionInstruction()
     instruction.timeRange = CMTimeRange(start: .zero, duration: safeDuration)
 
     let layerInstruction = AVMutableVideoCompositionLayerInstruction(assetTrack: compositionVideoTrack)
     layerInstruction.setTransform(transform, at: .zero)
-    if let replay = timeline.replayRange {
-      let replayEnd = CMTimeAdd(replay.start, replay.duration)
-      if CMTimeCompare(replay.start, .zero) >= 0, CMTimeCompare(replayEnd, safeDuration) <= 0 {
-        let zoomed = zoom(transform, renderSize: renderSize, scale: 1.25)
-        layerInstruction.setTransformRamp(fromStart: transform, toEnd: zoomed, timeRange: replay)
-        layerInstruction.setTransform(transform, at: replayEnd)
+    if let replay = timeline.replayRange, let ramp = frameRange(replay, limit: safeDuration) {
+      let zoomed = zoom(transform, renderSize: renderSize, scale: 1.25)
+      layerInstruction.setTransformRamp(fromStart: transform, toEnd: zoomed, timeRange: ramp)
+      let reset = CMTimeAdd(ramp.start, ramp.duration)
+      if CMTimeCompare(reset, safeDuration) < 0 {
+        layerInstruction.setTransform(transform, at: reset)
       }
     }
     instruction.layerInstructions = [layerInstruction]
@@ -175,22 +256,7 @@ private enum VideoFlipper {
     videoComposition.instructions = [instruction]
     videoComposition.renderSize = renderSize
     videoComposition.frameDuration = CMTime(value: 1, timescale: 30)
-    let filterName = Self.filterName(from: options)
-    let overlay = Self.needsOverlay(options: options, subtitle: subtitle)
-    if filterName.isEmpty {
-      WatermarkBurner.apply(
-        to: videoComposition,
-        renderSize: renderSize,
-        duration: safeDuration.seconds,
-        options: options,
-        subtitle: subtitle,
-        speechDuration: speechDuration
-      )
-    }
-    // 不跟原片的采样点走。Instagram 这类视频采样不连续，跟着走会报 Invalid sample cursor。
-    if videoComposition.animationTool != nil {
-      applyRec709(videoComposition)
-    }
+    // 水印和字幕另走一遍。和翻转放在同一次合成里时，系统会报 Operation Stopped。
 
     let outputURL = FileManager.default.temporaryDirectory
       .appendingPathComponent("flipped-\(UUID().uuidString).mp4")
@@ -200,12 +266,22 @@ private enum VideoFlipper {
       audioMix: audioMix(
         original: originalAudioTrack,
         speech: speechTrack,
-        speechDuration: speechDuration
+        speechDuration: min(speechDuration, max(safeDuration.seconds - 1.0 / 30.0, 0))
       ),
       outputURL: outputURL
     )
 
+    let filterName = Self.filterName(from: options)
+    let overlay = Self.needsOverlay(options: options, subtitle: subtitle)
     guard !filterName.isEmpty else {
+      if overlay {
+        return try await burnOverlay(
+          source: outputURL,
+          options: options,
+          subtitle: subtitle,
+          speechDuration: speechDuration
+        )
+      }
       return outputURL.absoluteString
     }
 
@@ -221,21 +297,15 @@ private enum VideoFlipper {
     guard overlay else {
       return filtered.absoluteString
     }
-
-    let burned = FileManager.default.temporaryDirectory
-      .appendingPathComponent("flipped-text-\(UUID().uuidString).mp4")
     do {
-      try await burnOverlay(
+      return try await burnOverlay(
         source: filtered,
-        output: burned,
         options: options,
         subtitle: subtitle,
         speechDuration: speechDuration
       )
-      try? FileManager.default.removeItem(at: filtered)
-      return burned.absoluteString
     } catch {
-      try? FileManager.default.removeItem(at: burned)
+      try? FileManager.default.removeItem(at: filtered)
       throw error
     }
   }
@@ -291,14 +361,20 @@ private enum VideoFlipper {
     }
     let range = try await videoTrack.load(.timeRange)
     try compositionVideo.insertTimeRange(range, of: videoTrack, at: .zero)
+    var compositionAudio: AVMutableCompositionTrack?
     if let audioTrack = try await asset.loadTracks(withMediaType: .audio).first,
-       let compositionAudio = composition.addMutableTrack(
+       let audio = composition.addMutableTrack(
         withMediaType: .audio,
         preferredTrackID: kCMPersistentTrackID_Invalid
        ) {
       let audioRange = try await audioTrack.load(.timeRange)
-      try? compositionAudio.insertTimeRange(audioRange, of: audioTrack, at: .zero)
+      let usable = CMTimeMinimum(range.duration, audioRange.duration)
+      if usable.isValid, usable.seconds > 0.02 {
+        try? audio.insertTimeRange(CMTimeRange(start: audioRange.start, duration: usable), of: audioTrack, at: .zero)
+        compositionAudio = audio
+      }
     }
+    _ = try alignToFrames(video: compositionVideo, audios: [compositionAudio], duration: range.duration)
     let videoComposition = LookFilter.composition(asset: composition, name: name)
     try await exportVideo(
       composition: composition,
@@ -310,11 +386,10 @@ private enum VideoFlipper {
 
   private static func burnOverlay(
     source: URL,
-    output: URL,
     options: [String: Any],
     subtitle: String,
     speechDuration: Double
-  ) async throws {
+  ) async throws -> String {
     let asset = AVURLAsset(url: source)
     guard let videoTrack = try await asset.loadTracks(withMediaType: .video).first else {
       throw VideoFlipError.noVideoTrack
@@ -328,22 +403,32 @@ private enum VideoFlipper {
     }
     let range = try await videoTrack.load(.timeRange)
     try compositionVideo.insertTimeRange(range, of: videoTrack, at: .zero)
+    var compositionAudio: AVMutableCompositionTrack?
     if let audioTrack = try await asset.loadTracks(withMediaType: .audio).first,
-       let compositionAudio = composition.addMutableTrack(
+       let audio = composition.addMutableTrack(
         withMediaType: .audio,
         preferredTrackID: kCMPersistentTrackID_Invalid
        ) {
       let audioRange = try await audioTrack.load(.timeRange)
-      try? compositionAudio.insertTimeRange(audioRange, of: audioTrack, at: .zero)
+      try? audio.insertTimeRange(audioRange, of: audioTrack, at: .zero)
+      compositionAudio = audio
     }
+    let duration = try alignToFrames(
+      video: compositionVideo,
+      audios: [compositionAudio],
+      duration: range.duration
+    )
     let naturalSize = try await videoTrack.load(.naturalSize)
     let preferred = try await videoTrack.load(.preferredTransform)
-    let fitted = CGRect(origin: .zero, size: naturalSize).applying(preferred)
-    let renderSize = CGSize(width: evenPixel(abs(fitted.width)), height: evenPixel(abs(fitted.height)))
+    let oriented = CGRect(origin: .zero, size: naturalSize).applying(preferred)
+    let upright = preferred.concatenating(
+      CGAffineTransform(translationX: -oriented.origin.x, y: -oriented.origin.y)
+    )
+    let renderSize = CGSize(width: evenPixel(abs(oriented.width)), height: evenPixel(abs(oriented.height)))
     let instruction = AVMutableVideoCompositionInstruction()
-    instruction.timeRange = CMTimeRange(start: .zero, duration: range.duration)
+    instruction.timeRange = CMTimeRange(start: .zero, duration: duration)
     let layerInstruction = AVMutableVideoCompositionLayerInstruction(assetTrack: compositionVideo)
-    layerInstruction.setTransform(preferred, at: .zero)
+    layerInstruction.setTransform(upright, at: .zero)
     instruction.layerInstructions = [layerInstruction]
     let videoComposition = AVMutableVideoComposition()
     videoComposition.instructions = [instruction]
@@ -352,18 +437,62 @@ private enum VideoFlipper {
     WatermarkBurner.apply(
       to: videoComposition,
       renderSize: renderSize,
-      duration: range.duration.seconds,
+      duration: duration.seconds,
       options: options,
       subtitle: subtitle,
       speechDuration: speechDuration
     )
-    applyRec709(videoComposition)
+    let output = FileManager.default.temporaryDirectory
+      .appendingPathComponent("flipped-text-\(UUID().uuidString).mp4")
     try await exportVideo(
       composition: composition,
       videoComposition: videoComposition,
       audioMix: nil,
       outputURL: output
     )
+    try? FileManager.default.removeItem(at: source)
+    return output.absoluteString
+  }
+
+  private static func alignToFrames(
+    video: AVMutableCompositionTrack,
+    audios: [AVMutableCompositionTrack?],
+    duration: CMTime
+  ) async throws -> CMTime {
+    let frames = max(Int(floor(duration.seconds * 30.0)), 1)
+    let aligned = CMTime(value: CMTimeValue(frames), timescale: 30)
+    let videoRange = try await video.load(.timeRange)
+    trim(video, range: videoRange, to: aligned)
+    for audio in audios {
+      guard let audio else { continue }
+      let audioRange = try await audio.load(.timeRange)
+      trim(audio, range: audioRange, to: aligned)
+    }
+    return aligned
+  }
+
+  private static func frameRange(_ range: CMTimeRange, limit: CMTime) -> CMTimeRange? {
+    let end = CMTimeAdd(range.start, range.duration)
+    let limitFrame = max(Int(floor(limit.seconds * 30.0 + 0.0001)), 0)
+    let startFrame = min(max(Int(ceil(range.start.seconds * 30.0 - 0.0001)), 0), limitFrame)
+    var endFrame = min(max(Int(floor(end.seconds * 30.0 + 0.0001)), startFrame), limitFrame)
+    if endFrame >= limitFrame {
+      endFrame = max(startFrame, limitFrame - 1)
+    }
+    guard endFrame - startFrame >= 2 else {
+      return nil
+    }
+    let startTime = CMTime(value: CMTimeValue(startFrame), timescale: 30)
+    let endTime = CMTime(value: CMTimeValue(endFrame), timescale: 30)
+    return CMTimeRange(start: startTime, duration: CMTimeSubtract(endTime, startTime))
+  }
+
+  private static func trim(_ track: AVMutableCompositionTrack, range: CMTimeRange, to aligned: CMTime) {
+    let end = CMTimeAdd(range.start, range.duration)
+    guard CMTimeCompare(end, aligned) > 0 else { return }
+    let start = CMTimeMaximum(aligned, range.start)
+    guard CMTimeCompare(end, start) > 0 else { return }
+    track.removeTimeRange(CMTimeRange(start: start, duration: CMTimeSubtract(end, start)))
   }
 
   private static func exportVideo(
@@ -433,9 +562,77 @@ private enum VideoFlipper {
       if ns.code == -11880 {
         return "这个视频的画面时间不连续，系统没法按原样翻转（-11880）"
       }
+      if ns.code == -11841 {
+        return "画面合成不合法（-11841）。请重试这一条。"
+      }
       return "\(error.localizedDescription)（\(ns.code)）"
     }
     return error.localizedDescription
+  }
+
+  private static func parseCut(_ options: [String: Any]) throws -> (start: Double, end: Double)? {
+    guard let raw = options["cut"] as? [String: Any] else {
+      return nil
+    }
+    guard let start = doubleValue(raw["start"]), let end = doubleValue(raw["end"]) else {
+      throw VideoFlipError.exportFailed("请填写要移除的开始和结束时间")
+    }
+    return (start, end)
+  }
+
+  private static func validateCut(_ cut: (start: Double, end: Double), duration: Double) throws {
+    guard cut.start.isFinite, cut.end.isFinite, cut.start >= 0, cut.end > cut.start + 0.04 else {
+      throw VideoFlipError.exportFailed("移除的开始时间要小于结束时间")
+    }
+    guard cut.start < duration - 0.04 else {
+      throw VideoFlipError.exportFailed("移除的开始时间已经超出这条视频")
+    }
+    let clippedEnd = min(cut.end, duration)
+    guard duration - (clippedEnd - cut.start) > 0.2 else {
+      throw VideoFlipError.exportFailed("不能把整段视频都剪掉")
+    }
+  }
+
+  private static func skipRange(
+    _ cut: (start: Double, end: Double),
+    sourceStart: CMTime,
+    duration: CMTime
+  ) -> CMTimeRange {
+    let clippedEnd = min(cut.end, duration.seconds)
+    return CMTimeRange(
+      start: CMTimeAdd(sourceStart, CMTime(seconds: cut.start, preferredTimescale: 600)),
+      duration: CMTime(seconds: clippedEnd - cut.start, preferredTimescale: 600)
+    )
+  }
+
+  private static func excise(
+    composition: AVMutableComposition,
+    video: AVMutableCompositionTrack,
+    audio: AVMutableCompositionTrack?,
+    start: Double,
+    end: Double
+  ) async throws -> Bool {
+    let range = try await video.load(.timeRange)
+    let clippedEnd = min(end, range.duration.seconds)
+    let remove = CMTimeRange(
+      start: CMTime(seconds: range.start.seconds + start, preferredTimescale: 600),
+      duration: CMTime(seconds: clippedEnd - start, preferredTimescale: 600)
+    )
+    video.removeTimeRange(remove)
+    guard let audio else {
+      return false
+    }
+    let audioRange = try await audio.load(.timeRange)
+    let piece = remove.intersection(audioRange)
+    if piece.isValid, piece.duration.isValid, piece.duration.seconds > 0.001 {
+      audio.removeTimeRange(piece)
+    }
+    let after = try await audio.load(.timeRange)
+    if !after.duration.isValid || after.duration.seconds < 0.02 {
+      composition.removeTrack(audio)
+      return false
+    }
+    return true
   }
 
   private static func parseExtend(_ options: [String: Any]) -> ClipExtend? {
@@ -499,7 +696,7 @@ private enum VideoFlipper {
   }
 
   static func clearProcessingCache() -> Double {
-    let prefixes = ["flipped-", "joined-", "poster-", "frame-", "marked-", "narration-"]
+    let prefixes = ["flipped-", "joined-", "poster-", "frame-", "marked-", "narration-", "smear-"]
     let extensions: Set<String> = ["mp4", "mov", "m4v", "jpg", "jpeg", "png", "heic", "caf", "m4a"]
     let fileManager = FileManager.default
     var roots = [fileManager.temporaryDirectory]
