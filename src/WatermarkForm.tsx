@@ -22,7 +22,18 @@ export function WatermarkForm({ value, onChange, embedded, disabled }: Props) {
         <Switch
           disabled={disabled}
           value={value.enabled}
-          onValueChange={(enabled) => patch({ enabled })}
+          onValueChange={(enabled) => {
+            if (!enabled) {
+              patch({ enabled: false });
+              return;
+            }
+            const placeCenter = value.placeCenter || !value.placeLeft;
+            patch({
+              enabled: true,
+              placeCenter,
+              placeLeft: value.placeLeft && !placeCenter,
+            });
+          }}
           trackColor={{ false: palette.switchOff, true: accent }}
         />
       </View>
@@ -64,7 +75,9 @@ export function WatermarkForm({ value, onChange, embedded, disabled }: Props) {
             <Switch
               disabled={disabled}
               value={value.placeLeft}
-              onValueChange={(placeLeft) => patch({ placeLeft })}
+              onValueChange={(placeLeft) =>
+                patch(placeLeft ? { placeLeft: true, placeCenter: false } : { placeLeft: false, placeCenter: true })
+              }
               trackColor={{ false: palette.switchOff, true: accent }}
             />
           </View>
@@ -73,11 +86,13 @@ export function WatermarkForm({ value, onChange, embedded, disabled }: Props) {
             <Switch
               disabled={disabled}
               value={value.placeCenter}
-              onValueChange={(placeCenter) => patch({ placeCenter })}
+              onValueChange={(placeCenter) =>
+                patch(placeCenter ? { placeLeft: false, placeCenter: true } : { placeLeft: true, placeCenter: false })
+              }
               trackColor={{ false: palette.switchOff, true: accent }}
             />
           </View>
-          <Text style={styles.hint}>默认不加水印。勾选后文字在左边和中央，颜色很淡，并轻微挪动。</Text>
+          <Text style={styles.hint}>只显示一个位置。视频从第 2 秒出现，到第 6 秒隐藏。</Text>
         </View>
       ) : null}
     </View>

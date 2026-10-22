@@ -184,18 +184,18 @@ export function PosterScreen() {
   return (
     <View style={[styles.screen, { paddingTop: insets.top + 8 }]}>
       <Text style={styles.title}>大字报</Text>
-      <Text style={styles.subtitle}>第一行是标题。后面每行写成「第5名 名字｜一句介绍」，会按抖音排行榜一条条翻出来。</Text>
+      <Text style={styles.subtitle}>一句一句切换。排行榜写成「第5名 名字｜一句介绍」，名次换的时候介绍也逐句出现。</Text>
       <ScrollView style={styles.list} contentContainerStyle={styles.listContent} keyboardShouldPersistTaps="handled">
         <TextInput
           value={script}
           onChangeText={setScript}
-          placeholder={'一行一句\n第二行接着翻'}
+          placeholder={'一句一句写\n下一句会替换上一句'}
           placeholderTextColor={palette.placeholder}
           multiline
           editable={!busy}
           style={styles.script}
         />
-        <Text style={styles.hint}>标题先出现，然后从第 5 名播到第 1 名。竖线后面是介绍。</Text>
+        <Text style={styles.hint}>不会把整段排成很多行。一句显示在画面中间，播完再换成下一句。</Text>
         <View style={styles.optionRow}>
           <Text style={styles.optionLabel}>背景铺满文案</Text>
           <Switch

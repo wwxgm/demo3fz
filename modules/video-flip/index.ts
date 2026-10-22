@@ -48,6 +48,7 @@ type VideoFlipNative = {
   processImage(uri: string, options: ImageProcessOptions): Promise<string>;
   sampleFrames(uri: string, count: number): Promise<string[]>;
   frameAt(uri: string, seconds: number): Promise<string>;
+  makeCover(uri: string, text: string): Promise<string>;
   coverSmear(uri: string, options: {
     regions: {
       x: number;
@@ -59,6 +60,15 @@ type VideoFlipNative = {
       end: number;
     }[];
   }): Promise<string>;
+  coverFace(uri: string, options: {
+    closedUri: string;
+    openUri?: string;
+    x: number;
+    y: number;
+    width: number;
+    height: number;
+    talk?: boolean;
+  }): Promise<string>;
   joinVideos(uris: string[]): Promise<string>;
   makePoster(script: string, backgroundUri: string, options?: {
     fill?: boolean;
@@ -66,6 +76,7 @@ type VideoFlipNative = {
     backgrounds?: { uri: string; kind: 'image' | 'video' }[];
   }): Promise<string>;
   loadPage(url: string, referer: string): Promise<string>;
+  stageOriginal(uri: string): Promise<string>;
   removeTempFile(uri: string): void;
   clearProcessingCache(): number;
 };
@@ -85,7 +96,13 @@ const missing: VideoFlipNative = {
   async frameAt() {
     throw new Error(missingMessage);
   },
+  async makeCover() {
+    throw new Error(missingMessage);
+  },
   async coverSmear() {
+    throw new Error(missingMessage);
+  },
+  async coverFace() {
     throw new Error(missingMessage);
   },
   async joinVideos() {
@@ -95,6 +112,9 @@ const missing: VideoFlipNative = {
     throw new Error(missingMessage);
   },
   async loadPage() {
+    throw new Error(missingMessage);
+  },
+  async stageOriginal() {
     throw new Error(missingMessage);
   },
   removeTempFile() {},

@@ -27,6 +27,13 @@ export function scaleBox(box: SmearBox, factor: number): SmearBox {
   return { x: snap(x), y: snap(y), width: snap(width), height: snap(height) };
 }
 
+/** 整体挪动区域，碰到画面边缘就停住。 */
+export function moveBox(box: SmearBox, dx: number, dy: number): SmearBox {
+  const x = clamp(box.x + dx, 0, 1 - box.width);
+  const y = clamp(box.y + dy, 0, 1 - box.height);
+  return { x: snap(x), y: snap(y), width: box.width, height: box.height };
+}
+
 export function checkSmearTime(
   start: number,
   end: number,

@@ -29,8 +29,8 @@ enum PosterMaker {
       guard !rows.isEmpty else {
         throw PosterError.message("请先输入文案")
       }
-      guard rows.count <= 16 else {
-        throw PosterError.message("文案最多 16 行，请删短一点")
+      guard rows.count <= 40 else {
+        throw PosterError.message("文案最多 40 句，请删短一点")
       }
     }
 
@@ -644,51 +644,59 @@ enum PosterMaker {
     parent.isGeometryFlipped = true
     parent.addSublayer(videoLayer)
 
-    let width = renderSize.width * 0.88
     let ranks = cards.filter { $0.rank }
     let title = cards.first(where: { !$0.rank })?.headline ?? ""
-    if !title.isEmpty {
-      let font = UIFont.systemFont(ofSize: renderSize.width * 0.058, weight: .black)
-      let box = wrappedSize(title, font: font, width: width)
-      let layer = textLayer(styled(title, font: font), size: box)
-      layer.position = CGPoint(x: renderSize.width / 2, y: renderSize.height * 0.1 + box.height / 2)
-      flip(layer, delay: 0.05, duration: 0.32)
-      parent.addSublayer(layer)
+    let titleLines = sentences(title)
+    let rawLead = titleLines.isEmpty ? 0.35 : Double(titleLines.count) * 1.15
+    let lead = min(rawLead, max(duration * 0.28, 0))
+    if !titleLines.isEmpty, lead > 0.05 {
+      let each = lead / Double(titleLines.count)
+      for (index, line) in titleLines.enumerated() {
+        let start = Double(index) * each
+        let end = index == titleLines.count - 1 ? lead : start + each
+        let fitted = fitSentence(line, canvas: renderSize)
+        let layer = textLayer(styled(line, font: fitted.font), size: fitted.size)
+        layer.position = CGPoint(x: renderSize.width / 2, y: renderSize.height * 0.16)
+        hold(layer, start: start, end: end, videoDuration: max(duration, end))
+        spinIn(layer, delay: start)
+        parent.addSublayer(layer)
+      }
     }
 
-    let lead = 0.9
-    let each = max((max(duration, 1) - lead) / Double(max(ranks.count, 1)), 0.8)
+    let rankSpan = max(duration - lead, 0)
+    let each = rankSpan / Double(max(ranks.count, 1))
     for (index, card) in ranks.enumerated() {
       let start = lead + Double(index) * each
       let end = index == ranks.count - 1 ? duration : start + each
-      let group = CALayer()
-      group.frame = canvas
-      let headFont = UIFont.systemFont(ofSize: renderSize.width * 0.064, weight: .black)
-      let bodyFont = UIFont.systemFont(ofSize: renderSize.width * 0.04, weight: .semibold)
-      let head = rankHeadline(card.headline, font: headFont, width: width)
-      let bodyBox = card.body.isEmpty ? .zero : wrappedSize(card.body, font: bodyFont, width: width)
-      let headLayer = textLayer(head.text, size: head.size)
-      let blockHeight = head.size.height + (bodyBox.height > 0 ? bodyBox.height + 18 : 0)
-      var cursor = (renderSize.height - blockHeight) / 2 + 20
-      headLayer.position = CGPoint(x: renderSize.width / 2, y: cursor + head.size.height / 2)
-      group.addSublayer(headLayer)
-      cursor += head.size.height + 18
-      if bodyBox.height > 0 {
-        let bodyLayer = textLayer(styled(card.body, font: bodyFont), size: bodyBox)
-        bodyLayer.position = CGPoint(x: renderSize.width / 2, y: cursor + bodyBox.height / 2)
-        group.addSublayer(bodyLayer)
+      guard end > start + 0.04 else { continue }
+      let head = fitSentence(card.headline, canvas: renderSize)
+      let headLayer = textLayer(rankHeadline(card.headline, font: head.font), size: head.size)
+      headLayer.position = CGPoint(x: renderSize.width / 2, y: renderSize.height * 0.4)
+      hold(headLayer, start: start, end: end, videoDuration: max(duration, end))
+      spinIn(headLayer, delay: start)
+      parent.addSublayer(headLayer)
+      let phrases = sentences(card.body)
+      let slice = (end - start) / Double(max(phrases.count, 1))
+      for (offset, phrase) in phrases.enumerated() {
+        let phraseStart = start + Double(offset) * slice
+        let phraseEnd = offset == phrases.count - 1 ? end : phraseStart + slice
+        guard phraseEnd > phraseStart + 0.04 else { continue }
+        let fitted = fitSentence(phrase, canvas: renderSize)
+        let bodyLayer = textLayer(styled(phrase, font: fitted.font), size: fitted.size)
+        bodyLayer.position = CGPoint(x: renderSize.width / 2, y: renderSize.height * 0.58)
+        hold(bodyLayer, start: phraseStart, end: phraseEnd, videoDuration: max(duration, phraseEnd))
+        spinIn(bodyLayer, delay: phraseStart)
+        parent.addSublayer(bodyLayer)
       }
-      hold(group, start: start, end: end, videoDuration: max(duration, end))
-      spinIn(group, delay: start)
-      parent.addSublayer(group)
     }
 
     composition.animationTool = AVVideoCompositionCoreAnimationTool(postProcessingAsVideoLayer: videoLayer, in: parent)
   }
 
-  private static func rankHeadline(_ headline: String, font: UIFont, width: CGFloat) -> (text: NSAttributedString, size: CGSize) {
+  private static func rankHeadline(_ headline: String, font: UIFont) -> NSAttributedString {
     let paragraph = NSMutableParagraphStyle()
     paragraph.alignment = .center
+    paragraph.lineBreakMode = .byClipping
     let text = NSMutableAttributedString()
     let base: [NSAttributedString.Key: Any] = [
       .font: font,
@@ -706,12 +714,7 @@ enum PosterMaker {
       attrs[.foregroundColor] = UIColor.white
       text.append(NSAttributedString(string: headline, attributes: attrs))
     }
-    let bounds = text.boundingRect(
-      with: CGSize(width: width, height: 800),
-      options: [.usesLineFragmentOrigin, .usesFontLeading],
-      context: nil
-    )
-    return (text, CGSize(width: width, height: ceil(bounds.height) + font.pointSize * 0.45))
+    return text
   }
 
   private static func textLayer(_ string: NSAttributedString, size: CGSize) -> CALayer {
@@ -747,11 +750,22 @@ enum PosterMaker {
 
   private static func hold(_ layer: CALayer, start: Double, end: Double, videoDuration: Double) {
     let video = max(videoDuration, 0.4)
-    let begin = min(max(start / video, 0), 0.97)
-    let show = min(max((start + 0.28) / video, begin + 0.01), 0.98)
-    let hide = min(max(end / video, show + 0.01), 1)
+    let begin = min(max(start / video, 0), 0.96)
+    let show = min(max((start + 0.22) / video, begin + 0.012), 0.97)
+    var hide = min(max(end / video, show + 0.012), 1)
+    if hide >= 0.995 {
+      hide = 1
+    }
     let anim = CAKeyframeAnimation(keyPath: "opacity")
-    if hide >= 0.99 {
+    if begin < 0.008 {
+      if hide >= 0.995 {
+        anim.values = [0, 1, 1]
+        anim.keyTimes = [0, NSNumber(value: show), 1]
+      } else {
+        anim.values = [0, 1, 1, 0]
+        anim.keyTimes = [0, NSNumber(value: show), NSNumber(value: hide), 1]
+      }
+    } else if hide >= 0.995 {
       anim.values = [0, 0, 1, 1]
       anim.keyTimes = [0, NSNumber(value: begin), NSNumber(value: show), 1]
     } else {
@@ -767,8 +781,6 @@ enum PosterMaker {
   }
 
   private static func burn(_ rows: [String], into composition: AVMutableVideoComposition, renderSize: CGSize, duration: Double) {
-    let clock = timing(lineCount: rows.count, limit: duration)
-    let fitted = layout(rows, canvas: renderSize)
     let parent = CALayer()
     let videoLayer = CALayer()
     let canvas = CGRect(origin: .zero, size: renderSize)
@@ -777,15 +789,16 @@ enum PosterMaker {
     parent.isGeometryFlipped = true
     parent.addSublayer(videoLayer)
 
-    let totalHeight = fitted.sizes.reduce(0) { $0 + $1.height } + fitted.gap * CGFloat(max(rows.count - 1, 0))
-    var top = (renderSize.height - totalHeight) / 2
+    let each = duration / Double(max(rows.count, 1))
     for (index, row) in rows.enumerated() {
-      let box = fitted.sizes[index]
-      let layer = textLayer(styled(row, font: fitted.font), size: box)
-      layer.position = CGPoint(x: renderSize.width / 2, y: top + box.height / 2)
-      flip(layer, delay: clock.gap * Double(index), duration: clock.flip)
+      let start = Double(index) * each
+      let end = index == rows.count - 1 ? duration : min(start + each, duration)
+      let fitted = fitSentence(row, canvas: renderSize)
+      let layer = textLayer(styled(row, font: fitted.font), size: fitted.size)
+      layer.position = CGPoint(x: renderSize.width / 2, y: renderSize.height / 2)
+      hold(layer, start: start, end: end, videoDuration: max(duration, end))
+      spinIn(layer, delay: start)
       parent.addSublayer(layer)
-      top += box.height + fitted.gap
     }
 
     composition.animationTool = AVVideoCompositionCoreAnimationTool(postProcessingAsVideoLayer: videoLayer, in: parent)
@@ -804,28 +817,6 @@ enum PosterMaker {
     layer.add(scale, forKey: "poster-scale")
   }
 
-  private static func flip(_ layer: CALayer, delay: Double, duration: Double) {
-    layer.transform = CATransform3DIdentity
-    layer.opacity = 1
-    let scale = CABasicAnimation(keyPath: "transform.scale")
-    scale.fromValue = 0.92
-    scale.toValue = 1
-    scale.duration = max(duration, 0.12)
-    scale.beginTime = AVCoreAnimationBeginTimeAtZero + delay
-    scale.timingFunction = CAMediaTimingFunction(name: .easeOut)
-    scale.fillMode = .both
-    scale.isRemovedOnCompletion = false
-    let fade = CABasicAnimation(keyPath: "opacity")
-    fade.fromValue = 0
-    fade.toValue = 1
-    fade.duration = max(duration * 0.65, 0.08)
-    fade.beginTime = AVCoreAnimationBeginTimeAtZero + delay
-    fade.fillMode = .both
-    fade.isRemovedOnCompletion = false
-    layer.add(scale, forKey: "poster-scale")
-    layer.add(fade, forKey: "poster-fade")
-  }
-
   private static func styled(_ text: String, font: UIFont) -> NSAttributedString {
     let paragraph = NSMutableParagraphStyle()
     paragraph.alignment = .center
@@ -836,68 +827,60 @@ enum PosterMaker {
     ])
   }
 
-  private static func layout(_ rows: [String], canvas: CGSize) -> (font: UIFont, sizes: [CGSize], gap: CGFloat) {
-    var point = min(canvas.width, canvas.height) * 0.18
-    let floor = max(28, min(canvas.width, canvas.height) * 0.045)
-    while point >= floor {
-      let font = UIFont.systemFont(ofSize: point, weight: .black)
-      let sizes = rows.map { measure($0, font: font) }
-      let widest = sizes.map(\.width).max() ?? 0
-      let gap = point * 0.06
-      let height = sizes.reduce(0) { $0 + $1.height } + gap * CGFloat(max(rows.count - 1, 0))
-      if widest <= canvas.width * 0.9 && height <= canvas.height * 0.72 {
-        return (font, sizes, gap)
-      }
-      point -= 2
-    }
-    let font = UIFont.systemFont(ofSize: floor, weight: .black)
-    return (font, rows.map { measure($0, font: font) }, floor * 0.06)
-  }
-
   private static func measure(_ text: String, font: UIFont) -> CGSize {
     let size = (text as NSString).size(withAttributes: [.font: font])
     let pad = font.pointSize * 0.42
     return CGSize(width: ceil(size.width + pad), height: ceil(size.height + font.pointSize * 0.45))
   }
 
-  private static func timing(lineCount: Int, limit: Double?) -> (gap: Double, flip: Double, total: Double) {
-    let gap = 0.16
-    let flip = 0.34
-    let needed = Double(max(lineCount - 1, 0)) * gap + flip
-    guard let limit else {
-      return (gap, flip, max(4, needed + 1.6))
-    }
-    let room = max(limit * 0.72, 0.45)
-    let scale = min(1, room / max(needed, 0.01))
-    return (gap * scale, max(flip * scale, 0.12), limit)
-  }
-
   private static func lines(from script: String) -> [String] {
     let normalized = script.replacingOccurrences(of: "\r\n", with: "\n").replacingOccurrences(of: "\r", with: "\n")
     var rows: [String] = []
     for part in normalized.split(separator: "\n", omittingEmptySubsequences: true) {
-      let line = part.trimmingCharacters(in: .whitespaces)
-      if line.isEmpty {
-        continue
-      }
-      rows.append(contentsOf: chunk(line, limit: 8))
+      rows.append(contentsOf: sentences(String(part)))
     }
     return rows
   }
 
-  private static func chunk(_ line: String, limit: Int) -> [String] {
-    let chars = Array(line)
-    if chars.count <= limit {
-      return [String(chars)]
+  private static func sentences(_ text: String) -> [String] {
+    let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+    if trimmed.isEmpty {
+      return []
     }
+    let breaks = CharacterSet(charactersIn: "。！？!?；;，,")
     var rows: [String] = []
-    var index = 0
-    while index < chars.count {
-      let end = min(index + limit, chars.count)
-      rows.append(String(chars[index..<end]))
-      index = end
+    var current = ""
+    for scalar in trimmed.unicodeScalars {
+      current.append(Character(scalar))
+      if breaks.contains(scalar) {
+        let piece = current.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !piece.isEmpty {
+          rows.append(piece)
+        }
+        current = ""
+      }
+    }
+    let tail = current.trimmingCharacters(in: .whitespacesAndNewlines)
+    if !tail.isEmpty {
+      rows.append(tail)
     }
     return rows
+  }
+
+  private static func fitSentence(_ text: String, canvas: CGSize) -> (font: UIFont, size: CGSize) {
+    let maxWidth = canvas.width * 0.86
+    var point = min(canvas.width, canvas.height) * 0.11
+    let floor = max(34, min(canvas.width, canvas.height) * 0.048)
+    while point >= floor {
+      let font = UIFont.systemFont(ofSize: point, weight: .black)
+      let size = measure(text, font: font)
+      if size.width <= maxWidth, size.height <= canvas.height * 0.28 {
+        return (font, size)
+      }
+      point -= 2
+    }
+    let font = UIFont.systemFont(ofSize: floor, weight: .black)
+    return (font, wrappedSize(text, font: font, width: maxWidth))
   }
 
   private static func writeBlack(size: CGSize, seconds: Double) async throws -> URL {
@@ -1130,9 +1113,9 @@ enum PosterMaker {
 
   private static func scriptSeconds(ranked: Bool, rankCount: Int, lineCount: Int) -> Double {
     if ranked {
-      return 1.2 + Double(max(rankCount, 1)) * 3.4
+      return 1.4 + Double(max(rankCount, 1)) * 4.2
     }
-    return timing(lineCount: lineCount, limit: nil).total
+    return max(4, Double(max(lineCount, 1)) * 1.6)
   }
 
   private static func flag(_ options: [String: Any], key: String, default defaultValue: Bool) -> Bool {

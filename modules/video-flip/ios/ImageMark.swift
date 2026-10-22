@@ -26,11 +26,14 @@ enum MarkConfigParser {
       fontSize: cg(raw["fontSize"]) ?? 16,
       opacity: cg(raw["opacity"]) ?? 0.25,
       move: bool(raw["move"], default: true),
-      placeLeft: bool(raw["placeLeft"], default: true),
+      placeLeft: bool(raw["placeLeft"], default: false),
       placeCenter: bool(raw["placeCenter"], default: true),
       flip: bool(options["flip"]),
       crop: nil
     )
+    if config.placeLeft && config.placeCenter {
+      config.placeLeft = false
+    }
     if !config.placeLeft && !config.placeCenter {
       config.placeCenter = true
     }
@@ -111,30 +114,18 @@ enum WatermarkBurner {
     if let mark {
       let fontSize = fittedFontSize(mark.fontSize, canvas: renderSize)
       let textSize = measure(mark.text, fontSize: fontSize)
-      if mark.placeLeft {
-      let preferred = CGPoint(x: 16 + textSize.width / 2, y: renderSize.height / 2)
+      let center = mark.placeCenter
+        ? CGPoint(x: renderSize.width / 2, y: renderSize.height / 2)
+        : CGPoint(x: 16 + textSize.width / 2, y: renderSize.height / 2)
       parent.addSublayer(textLayer(
         mark: mark,
         fontSize: fontSize,
         textSize: textSize,
-        center: place(preferred, textSize: textSize, canvas: renderSize),
+        center: place(center, textSize: textSize, canvas: renderSize),
         canvas: renderSize,
-        phase: 0.4,
+        phase: mark.placeCenter ? 1.7 : 0.4,
         duration: safeDuration
       ))
-    }
-    if mark.placeCenter {
-      let preferred = CGPoint(x: renderSize.width / 2, y: renderSize.height / 2)
-      parent.addSublayer(textLayer(
-        mark: mark,
-        fontSize: fontSize,
-        textSize: textSize,
-        center: place(preferred, textSize: textSize, canvas: renderSize),
-        canvas: renderSize,
-        phase: 1.7,
-        duration: safeDuration
-      ))
-      }
     }
     if !line.isEmpty {
       parent.addSublayer(subtitleLayer(text: line, canvas: renderSize, duration: safeDuration, speechDuration: speechDuration))
@@ -217,7 +208,6 @@ enum WatermarkBurner {
     layer.foregroundColor = UIColor.white.cgColor
     layer.alignmentMode = .center
     layer.contentsScale = 2
-    layer.opacity = Float(mark.opacity)
     layer.shadowColor = UIColor.black.cgColor
     layer.shadowOpacity = 0.45
     layer.shadowRadius = 1.5
@@ -225,10 +215,47 @@ enum WatermarkBurner {
     layer.bounds = CGRect(origin: .zero, size: textSize)
     layer.anchorPoint = CGPoint(x: 0.5, y: 0.5)
     layer.position = center
+    layer.opacity = 0
+    showMark(layer, opacity: Float(mark.opacity), videoDuration: duration)
     if mark.move {
       layer.add(wander(around: center, textSize: textSize, canvas: canvas, phase: phase, duration: duration), forKey: "wander")
     }
     return layer
+  }
+
+  private static func showMark(_ layer: CALayer, opacity: Float, videoDuration: Double) {
+    let video = max(videoDuration, 0.2)
+    let showAt = 2.0
+    let hideAt = min(6.0, video)
+    guard hideAt > showAt + 0.15 else {
+      layer.opacity = 0
+      return
+    }
+    let start = showAt / video
+    let end = min(hideAt / video, 0.995)
+    let fade = min(0.12 / video, max((end - start) / 3, 0.004))
+    let shown = min(start + fade, end - fade)
+    let hidden = min(end + fade, 0.999)
+    guard shown > start, end > shown, hidden > end, hidden < 1 else {
+      layer.opacity = 0
+      return
+    }
+    let animation = CAKeyframeAnimation(keyPath: "opacity")
+    animation.values = [0, 0, opacity, opacity, 0, 0]
+    animation.keyTimes = [
+      0,
+      NSNumber(value: start),
+      NSNumber(value: shown),
+      NSNumber(value: end),
+      NSNumber(value: hidden),
+      1,
+    ]
+    animation.duration = video
+    animation.beginTime = AVCoreAnimationBeginTimeAtZero
+    animation.isRemovedOnCompletion = false
+    animation.fillMode = .forwards
+    layer.opacity = 0
+    layer.add(animation, forKey: "mark-window")
   }
 
   private static func wander(

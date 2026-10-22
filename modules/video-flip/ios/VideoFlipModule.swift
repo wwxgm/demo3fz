@@ -1,5 +1,5 @@
-import ExpoModulesCore
 import AVFoundation
+import ExpoModulesCore
 
 public class VideoFlipModule: Module {
   public func definition() -> ModuleDefinition {
@@ -21,8 +21,16 @@ public class VideoFlipModule: Module {
       try await ImageMark.frameAt(uri: uri, seconds: seconds)
     }
 
+    AsyncFunction("makeCover") { (uri: String, text: String) async throws -> String in
+      try await CoverMaker.make(uri: uri, text: text)
+    }
+
     AsyncFunction("coverSmear") { (uri: String, options: [String: Any]) async throws -> String in
       try await Smear.cover(uri: uri, options: options)
+    }
+
+    AsyncFunction("coverFace") { (uri: String, options: [String: Any]) async throws -> String in
+      try await FaceCover.cover(uri: uri, options: options)
     }
 
     AsyncFunction("joinVideos") { (uris: [String]) async throws -> String in
@@ -35,6 +43,10 @@ public class VideoFlipModule: Module {
 
     AsyncFunction("loadPage") { (url: String, referer: String) async throws -> String in
       try await PageLoader.load(url: url, referer: referer)
+    }
+
+    AsyncFunction("stageOriginal") { (uri: String) async throws -> String in
+      try VideoFlipper.stageOriginal(uri)
     }
 
     Function("removeTempFile") { (uri: String) in
@@ -124,7 +136,12 @@ func applyRec709(_ composition: AVMutableVideoComposition) {
 }
 
 private enum VideoFlipper {
-  static func flipHorizontal(uri: String, options: [String: Any]) async throws -> String {
+  static func flipHorizontal(
+    uri: String,
+    options: [String: Any],
+    allowRepack: Bool = true,
+    followSourceFrames: Bool = false
+  ) async throws -> String {
     let sourceURL = try resolveFileURL(uri)
     let accessed = sourceURL.startAccessingSecurityScopedResource()
     defer {
@@ -232,11 +249,22 @@ private enum VideoFlipper {
     }
 
     let composedRange = try await compositionVideoTrack.load(.timeRange)
-    let safeDuration = try await alignToFrames(
-      video: compositionVideoTrack,
-      audios: [originalAudioTrack, speechTrack],
-      duration: CMTimeMinimum(timelineDuration, composedRange.duration)
-    )
+    let safeDuration: CMTime
+    if followSourceFrames {
+      safeDuration = CMTimeMinimum(timelineDuration, composedRange.duration)
+      trim(compositionVideoTrack, range: composedRange, to: safeDuration)
+      for audio in [originalAudioTrack, speechTrack] {
+        guard let audio else { continue }
+        let audioRange = try await audio.load(.timeRange)
+        trim(audio, range: audioRange, to: safeDuration)
+      }
+    } else {
+      safeDuration = try await alignToFrames(
+        video: compositionVideoTrack,
+        audios: [originalAudioTrack, speechTrack],
+        duration: CMTimeMinimum(timelineDuration, composedRange.duration)
+      )
+    }
     let instruction = AVMutableVideoCompositionInstruction()
     instruction.timeRange = CMTimeRange(start: .zero, duration: safeDuration)
 
@@ -255,21 +283,48 @@ private enum VideoFlipper {
     let videoComposition = AVMutableVideoComposition()
     videoComposition.instructions = [instruction]
     videoComposition.renderSize = renderSize
-    videoComposition.frameDuration = CMTime(value: 1, timescale: 30)
+    if followSourceFrames {
+      let minFrame = try await compositionVideoTrack.load(.minFrameDuration)
+      if minFrame.isValid, minFrame.seconds >= 1.0 / 120.0, minFrame.seconds <= 0.1 {
+        videoComposition.frameDuration = minFrame
+      } else {
+        videoComposition.frameDuration = CMTime(value: 1, timescale: 30)
+      }
+      videoComposition.sourceTrackIDForFrameTiming = compositionVideoTrack.trackID
+    } else {
+      videoComposition.frameDuration = CMTime(value: 1, timescale: 30)
+    }
     // 水印和字幕另走一遍。和翻转放在同一次合成里时，系统会报 Operation Stopped。
 
     let outputURL = FileManager.default.temporaryDirectory
       .appendingPathComponent("flipped-\(UUID().uuidString).mp4")
-    try await exportVideo(
-      composition: composition,
-      videoComposition: videoComposition,
-      audioMix: audioMix(
-        original: originalAudioTrack,
-        speech: speechTrack,
-        speechDuration: min(speechDuration, max(safeDuration.seconds - 1.0 / 30.0, 0))
-      ),
-      outputURL: outputURL
-    )
+    do {
+      try await exportVideo(
+        composition: composition,
+        videoComposition: videoComposition,
+        audioMix: audioMix(
+          original: originalAudioTrack,
+          speech: speechTrack,
+          speechDuration: min(speechDuration, max(safeDuration.seconds - 1.0 / 30.0, 0))
+        ),
+        outputURL: outputURL
+      )
+    } catch {
+      guard allowRepack, isBrokenTiming(error) else { throw error }
+      let packed: URL
+      do {
+        packed = try await repackCompressed(sourceURL)
+      } catch {
+        throw VideoFlipError.exportFailed("这个视频的画面时间不连续，系统没法按原样翻转（-11880）")
+      }
+      defer { try? FileManager.default.removeItem(at: packed) }
+      return try await flipHorizontal(
+        uri: packed.absoluteString,
+        options: options,
+        allowRepack: false,
+        followSourceFrames: true
+      )
+    }
 
     let filterName = Self.filterName(from: options)
     let overlay = Self.needsOverlay(options: options, subtitle: subtitle)
@@ -547,6 +602,9 @@ private enum VideoFlipper {
       if failure == "翻转已取消" {
         throw VideoFlipError.exportFailed("翻转已取消")
       }
+      if failure?.contains("-11880") == true {
+        throw VideoFlipError.exportFailed(failure ?? "这个视频的画面时间不连续，系统没法按原样翻转（-11880）")
+      }
       last = failure ?? "翻转完成但没有生成文件"
       try? FileManager.default.removeItem(at: outputURL)
     }
@@ -568,6 +626,197 @@ private enum VideoFlipper {
       return "\(error.localizedDescription)（\(ns.code)）"
     }
     return error.localizedDescription
+  }
+
+  private static func isBrokenTiming(_ error: Error) -> Bool {
+    let ns = error as NSError
+    if ns.domain == AVFoundationErrorDomain, ns.code == -11880 {
+      return true
+    }
+    return ns.localizedDescription.contains("-11880")
+  }
+
+  /// 不抽帧。只把压缩数据按原样重新封装，修掉坏掉的画面索引，再走原来的翻转。
+  private static func repackCompressed(_ url: URL) async throws -> URL {
+    let asset = AVURLAsset(url: url)
+    guard let videoTrack = try await asset.loadTracks(withMediaType: .video).first else {
+      throw VideoFlipError.noVideoTrack
+    }
+    let videoHints = try await videoTrack.load(.formatDescriptions)
+    guard let videoHint = videoHints.first else {
+      throw VideoFlipError.exportFailed("这个视频的画面时间不连续，系统没法按原样翻转（-11880）")
+    }
+    let transform = try await videoTrack.load(.preferredTransform)
+    let audioTrack = try await asset.loadTracks(withMediaType: .audio).first
+    var audioHint: CMFormatDescription?
+    if let audioTrack {
+      audioHint = try await audioTrack.load(.formatDescriptions).first
+    }
+
+    let output = FileManager.default.temporaryDirectory.appendingPathComponent("flipped-src-\(UUID().uuidString).mp4")
+    if FileManager.default.fileExists(atPath: output.path) {
+      try? FileManager.default.removeItem(at: output)
+    }
+
+    let reader = try AVAssetReader(asset: asset)
+    let videoOutput = AVAssetReaderTrackOutput(track: videoTrack, outputSettings: nil)
+    videoOutput.alwaysCopiesSampleData = true
+    guard reader.canAdd(videoOutput) else {
+      throw VideoFlipError.exportFailed("这个视频的画面时间不连续，系统没法按原样翻转（-11880）")
+    }
+    reader.add(videoOutput)
+    guard reader.startReading() else {
+      throw VideoFlipError.exportFailed(reader.error?.localizedDescription ?? "这个视频的画面时间不连续，系统没法按原样翻转（-11880）")
+    }
+
+    let writer = try AVAssetWriter(outputURL: output, fileType: .mp4)
+    let videoInput = AVAssetWriterInput(mediaType: .video, outputSettings: nil, sourceFormatHint: videoHint)
+    videoInput.transform = transform
+    videoInput.expectsMediaDataInRealTime = false
+    guard writer.canAdd(videoInput) else {
+      throw VideoFlipError.exportFailed("这个视频的画面时间不连续，系统没法按原样翻转（-11880）")
+    }
+    writer.add(videoInput)
+    var audioInput: AVAssetWriterInput?
+    if let audioHint, audioTrack != nil {
+      let input = AVAssetWriterInput(mediaType: .audio, outputSettings: nil, sourceFormatHint: audioHint)
+      input.expectsMediaDataInRealTime = false
+      if writer.canAdd(input) {
+        writer.add(input)
+        audioInput = input
+      }
+    }
+    guard writer.startWriting() else {
+      throw VideoFlipError.exportFailed(writer.error?.localizedDescription ?? "这个视频的画面时间不连续，系统没法按原样翻转（-11880）")
+    }
+    guard let first = videoOutput.copyNextSampleBuffer() else {
+      writer.cancelWriting()
+      try? FileManager.default.removeItem(at: output)
+      throw VideoFlipError.exportFailed(reader.error?.localizedDescription ?? "这个视频的画面时间不连续，系统没法按原样翻转（-11880）")
+    }
+    let start = CMSampleBufferGetPresentationTimeStamp(first)
+    let sessionStart = start.flags.contains(.valid) && start.seconds.isFinite ? start : CMTime.zero
+    writer.startSession(atSourceTime: sessionStart)
+
+    do {
+      try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+        let queue = DispatchQueue(label: "flip.repack")
+        var finished = false
+        var pending: CMSampleBuffer? = first
+        var wroteVideo = false
+        videoInput.requestMediaDataWhenReady(on: queue) {
+          while videoInput.isReadyForMoreMediaData && !finished {
+            let sample: CMSampleBuffer
+            if let held = pending {
+              pending = nil
+              sample = held
+            } else if let next = videoOutput.copyNextSampleBuffer() {
+              sample = next
+            } else {
+              finished = true
+              videoInput.markAsFinished()
+              if reader.status == .failed || !wroteVideo {
+                continuation.resume(throwing: VideoFlipError.exportFailed(reader.error?.localizedDescription ?? "这个视频的画面时间不连续，系统没法按原样翻转（-11880）"))
+                return
+              }
+              guard let audioInput, let audioTrack, audioHint != nil else {
+                writer.finishWriting {
+                  if writer.status == .completed {
+                    continuation.resume()
+                  } else {
+                    continuation.resume(throwing: VideoFlipError.exportFailed(writer.error?.localizedDescription ?? "这个视频的画面时间不连续，系统没法按原样翻转（-11880）"))
+                  }
+                }
+                return
+              }
+              let audioReader: AVAssetReader
+              do {
+                audioReader = try AVAssetReader(asset: asset)
+              } catch {
+                writer.finishWriting {
+                  if writer.status == .completed {
+                    continuation.resume()
+                  } else {
+                    continuation.resume(throwing: VideoFlipError.exportFailed(writer.error?.localizedDescription ?? "这个视频的画面时间不连续，系统没法按原样翻转（-11880）"))
+                  }
+                }
+                return
+              }
+              let audioSampleOutput = AVAssetReaderTrackOutput(track: audioTrack, outputSettings: nil)
+              audioSampleOutput.alwaysCopiesSampleData = true
+              guard audioReader.canAdd(audioSampleOutput) else {
+                writer.finishWriting {
+                  if writer.status == .completed {
+                    continuation.resume()
+                  } else {
+                    continuation.resume(throwing: VideoFlipError.exportFailed(writer.error?.localizedDescription ?? "这个视频的画面时间不连续，系统没法按原样翻转（-11880）"))
+                  }
+                }
+                return
+              }
+              audioReader.add(audioSampleOutput)
+              guard audioReader.startReading() else {
+                writer.finishWriting {
+                  if writer.status == .completed {
+                    continuation.resume()
+                  } else {
+                    continuation.resume(throwing: VideoFlipError.exportFailed(writer.error?.localizedDescription ?? "这个视频的画面时间不连续，系统没法按原样翻转（-11880）"))
+                  }
+                }
+                return
+              }
+              audioInput.requestMediaDataWhenReady(on: queue) {
+                while audioInput.isReadyForMoreMediaData {
+                  guard let audioSample = audioSampleOutput.copyNextSampleBuffer() else {
+                    audioInput.markAsFinished()
+                    writer.finishWriting {
+                      if writer.status == .completed {
+                        continuation.resume()
+                      } else {
+                        continuation.resume(throwing: VideoFlipError.exportFailed(writer.error?.localizedDescription ?? "这个视频的画面时间不连续，系统没法按原样翻转（-11880）"))
+                      }
+                    }
+                    return
+                  }
+                  let pts = CMSampleBufferGetPresentationTimeStamp(audioSample)
+                  if pts.flags.contains(.valid), CMTimeCompare(pts, sessionStart) < 0 {
+                    continue
+                  }
+                  if audioInput.append(audioSample) {
+                    continue
+                  }
+                  audioInput.markAsFinished()
+                  writer.finishWriting {
+                    if writer.status == .completed {
+                      continuation.resume()
+                    } else {
+                      continuation.resume(throwing: VideoFlipError.exportFailed(writer.error?.localizedDescription ?? "这个视频的画面时间不连续，系统没法按原样翻转（-11880）"))
+                    }
+                  }
+                  return
+                }
+              }
+              return
+            }
+            if videoInput.append(sample) {
+              wroteVideo = true
+              continue
+            }
+            finished = true
+            videoInput.markAsFinished()
+            continuation.resume(throwing: VideoFlipError.exportFailed(writer.error?.localizedDescription ?? "这个视频的画面时间不连续，系统没法按原样翻转（-11880）"))
+            return
+          }
+        }
+      }
+    } catch {
+      try? FileManager.default.removeItem(at: output)
+      throw error
+    }
+    guard FileManager.default.fileExists(atPath: output.path) else {
+      throw VideoFlipError.exportFailed("这个视频的画面时间不连续，系统没法按原样翻转（-11880）")
+    }
+    return output
   }
 
   private static func parseCut(_ options: [String: Any]) throws -> (start: Double, end: Double)? {
@@ -682,6 +931,27 @@ private enum VideoFlipper {
     return number.doubleValue
   }
 
+  static func stageOriginal(_ uri: String) throws -> String {
+    let source = try resolveFileURL(uri)
+    let accessed = source.startAccessingSecurityScopedResource()
+    defer {
+      if accessed {
+        source.stopAccessingSecurityScopedResource()
+      }
+    }
+    guard FileManager.default.fileExists(atPath: source.path) else {
+      throw VideoFlipError.badUri
+    }
+    let ext = source.pathExtension.isEmpty ? "mp4" : source.pathExtension
+    let output = FileManager.default.temporaryDirectory
+      .appendingPathComponent("original-\(UUID().uuidString).\(ext)")
+    if FileManager.default.fileExists(atPath: output.path) {
+      try? FileManager.default.removeItem(at: output)
+    }
+    try FileManager.default.copyItem(at: source, to: output)
+    return output.absoluteString
+  }
+
   static func removeTempFile(uri: String) {
     guard let url = try? resolveFileURL(uri) else {
       return
@@ -696,7 +966,7 @@ private enum VideoFlipper {
   }
 
   static func clearProcessingCache() -> Double {
-    let prefixes = ["flipped-", "joined-", "poster-", "frame-", "marked-", "narration-", "smear-"]
+    let prefixes = ["flipped-", "joined-", "poster-", "frame-", "marked-", "narration-", "smear-", "original-", "face-", "cover-"]
     let extensions: Set<String> = ["mp4", "mov", "m4v", "jpg", "jpeg", "png", "heic", "caf", "m4a"]
     let fileManager = FileManager.default
     var roots = [fileManager.temporaryDirectory]

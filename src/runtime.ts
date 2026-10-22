@@ -23,21 +23,23 @@ export const defaultWatermark: WatermarkSettings = {
   fontSize: 16,
   opacity: 0.25,
   move: true,
-  placeLeft: true,
+  placeLeft: false,
   placeCenter: true,
 };
 
 export function watermarkPayload(settings: WatermarkSettings) {
   if (!settings.enabled) return undefined;
   const text = settings.text.trim() || '南方小猴子';
+  const placeCenter = settings.placeCenter || !settings.placeLeft;
+  const placeLeft = settings.placeLeft && !placeCenter;
   return {
     enabled: true as const,
     text,
     fontSize: settings.fontSize,
     opacity: settings.opacity,
     move: settings.move,
-    placeLeft: settings.placeLeft,
-    placeCenter: settings.placeCenter || !settings.placeLeft,
+    placeLeft,
+    placeCenter,
   };
 }
 

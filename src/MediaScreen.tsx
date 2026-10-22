@@ -19,6 +19,7 @@ import * as MediaLibrary from 'expo-media-library';
 import VideoFlip from '../modules/video-flip';
 import { CropEditor } from './CropEditor';
 import { MergeScreen } from './MergeScreen';
+import { FaceCoverScreen } from './FaceCoverScreen';
 import { SmearScreen } from './SmearScreen';
 import { WatermarkForm } from './WatermarkForm';
 import { useTheme, type Palette } from './theme';
@@ -48,6 +49,10 @@ type MediaItem = {
   filter?: 'vivid' | 'warm' | 'cool' | 'mono';
   watermark?: WatermarkSettings;
   cut?: { start: string; end: string };
+  sampleFrames?: boolean;
+  cover?: boolean;
+  coverText?: string;
+  originalSaved?: boolean;
 };
 
 const VIDEO_EXT = /\.(mp4|mov|m4v|avi|mkv|webm|3gp|mpeg|mpg)$/i;
@@ -113,14 +118,16 @@ export function MediaScreen() {
   const [followClip, setFollowClip] = useState<{ uri: string; name: string } | null>(null);
   const [mergeOpen, setMergeOpen] = useState(false);
   const [smearOpen, setSmearOpen] = useState(false);
+  const [faceOpen, setFaceOpen] = useState(false);
   const [flipImages, setFlipImages] = useState(false);
   const [crop, setCrop] = useState<CropNorm | null>(null);
   const [cropSampleId, setCropSampleId] = useState<string | null>(null);
   const [cropOpen, setCropOpen] = useState(false);
   const [running, setRunning] = useState(false);
   const [picking, setPicking] = useState(false);
+  const [savingOriginalId, setSavingOriginalId] = useState<string | null>(null);
   const [summary, setSummary] = useState('');
-  const busy = running || picking;
+  const busy = running || picking || savingOriginalId != null;
   const items = kind === 'video' ? videos : images;
   const setItems = kind === 'video' ? setVideos : setImages;
   const sample = images.find((item) => item.id === cropSampleId) ?? images[0];
@@ -219,6 +226,27 @@ export function MediaScreen() {
       Alert.alert('无法打开文件', errorText(error));
     } finally {
       setPicking(false);
+    }
+  };
+
+  const saveOriginal = async (item: MediaItem) => {
+    if (busy || savingOriginalId || item.originalSaved) return;
+    setSavingOriginalId(item.id);
+    const allowed = await ensurePermission();
+    if (!allowed) {
+      setSavingOriginalId(null);
+      return;
+    }
+    let staged = '';
+    try {
+      staged = await VideoFlip.stageOriginal(item.uri);
+      await MediaLibrary.createAssetAsync(staged);
+      setVideos((prev) => prev.map((it) => (it.id === item.id ? { ...it, originalSaved: true } : it)));
+    } catch (error) {
+      Alert.alert('原视频没有保存', errorText(error));
+    } finally {
+      if (staged) VideoFlip.removeTempFile(staged);
+      setSavingOriginalId(null);
     }
   };
 
@@ -368,14 +396,54 @@ export function MediaScreen() {
           );
           await MediaLibrary.createAssetAsync(outputUri);
         });
+        let notes: string[] = [];
+        const missed: string[] = [];
+        if (kind === 'video' && item.sampleFrames && outputUri) {
+          let frames: string[] = [];
+          try {
+            setItems((prev) =>
+              prev.map((it) => (it.id === item.id ? { ...it, status: 'saving', message: '正在抽这一条的画面…' } : it)),
+            );
+            frames = await VideoFlip.sampleFrames(outputUri, 4);
+            await saveNext(async () => {
+              for (const frame of frames) {
+                await MediaLibrary.createAssetAsync(frame);
+              }
+            });
+            notes.push(`另存 ${frames.length} 张抽帧图片`);
+          } catch {
+            missed.push('抽帧');
+          } finally {
+            frames.forEach((frame) => VideoFlip.removeTempFile(frame));
+          }
+        }
+        if (kind === 'video' && item.cover && outputUri) {
+          let coverUri = '';
+          try {
+            setItems((prev) =>
+              prev.map((it) => (it.id === item.id ? { ...it, status: 'saving', message: '正在做这一条的封面…' } : it)),
+            );
+            coverUri = await VideoFlip.makeCover(outputUri, item.coverText?.trim() ?? '');
+            await saveNext(async () => {
+              await MediaLibrary.createAssetAsync(coverUri);
+            });
+            notes.push('另存 1 张封面');
+          } catch {
+            missed.push('封面');
+          } finally {
+            if (coverUri) VideoFlip.removeTempFile(coverUri);
+          }
+        }
         saved += 1;
+        const savedNote = notes.length > 0 ? `，${notes.join('，')}` : '';
+        const missedNote = missed.length > 0 ? `。视频已保存，这一条${missed.join('和')}没有成功` : '';
         setItems((prev) =>
           prev.map((it) =>
             it.id === item.id
               ? {
                   ...it,
                   status: 'saved',
-                  message: '已保存到相册',
+                  message: `已保存到相册${savedNote}${missedNote}`,
                 }
               : it,
           ),
@@ -458,6 +526,10 @@ export function MediaScreen() {
     return <SmearScreen onClose={() => setSmearOpen(false)} />;
   }
 
+  if (faceOpen) {
+    return <FaceCoverScreen onClose={() => setFaceOpen(false)} />;
+  }
+
   if (mergeOpen) {
     return <MergeScreen onClose={() => setMergeOpen(false)} />;
   }
@@ -474,6 +546,9 @@ export function MediaScreen() {
             <Pressable disabled={busy} onPress={() => setSmearOpen(true)} hitSlop={8}>
               <Text style={styles.link}>去水印</Text>
             </Pressable>
+            <Pressable disabled={busy} onPress={() => setFaceOpen(true)} hitSlop={8}>
+              <Text style={styles.link}>遮脸</Text>
+            </Pressable>
             <Pressable disabled={busy} onPress={() => setMergeOpen(true)} hitSlop={8}>
               <Text style={styles.link}>合并</Text>
             </Pressable>
@@ -482,7 +557,7 @@ export function MediaScreen() {
       </View>
       <Text style={styles.subtitle}>
         {kind === 'video'
-          ? '可多选视频，一键左右镜像。每条视频单独设置字幕、滤镜和水印。'
+          ? '可多选视频，一键左右镜像。每条视频单独设置字幕、滤镜、水印、抽帧和封面。'
           : '可多选图片。翻转、水印和裁剪会一起应用到全部，并保存到相册。'}
       </Text>
       <View style={styles.segment}>
@@ -509,7 +584,7 @@ export function MediaScreen() {
               ))}
             </View>
             <Text style={styles.optionHint}>
-              字幕、滤镜、水印和移除片段都在每条视频下面单独设置。不填写或不勾选的那一条不会做这项处理。有字幕的会用系统中文男声解说，原声在解说期间变小。
+              字幕、滤镜、水印、移除片段、抽帧和封面都在每条视频下面单独设置。不填写或不勾选的那一条不会做这项处理。有字幕的会用系统中文男声解说，原声在解说期间变小。
             </Text>
             <View style={styles.optionRow}>
               <Text style={styles.optionLabel}>延长视频</Text>
@@ -757,6 +832,55 @@ export function MediaScreen() {
                           </Text>
                         </>
                       ) : null}
+                      <View style={styles.optionRow}>
+                        <Text style={styles.optionLabel}>随机抽帧</Text>
+                        <Switch
+                          disabled={busy}
+                          value={item.sampleFrames === true}
+                          onValueChange={(enabled) =>
+                            setVideos((prev) =>
+                              prev.map((it) => (it.id === item.id ? { ...it, sampleFrames: enabled } : it)),
+                            )
+                          }
+                          trackColor={{ false: palette.switchOff, true: accent }}
+                        />
+                      </View>
+                      {item.sampleFrames ? (
+                        <Text style={styles.optionHint}>
+                          只对这一条。翻转保存成功后，从成片随机再存 4 张图片。关掉则不抽。
+                        </Text>
+                      ) : null}
+                      <View style={styles.optionRow}>
+                        <Text style={styles.optionLabel}>封面</Text>
+                        <Switch
+                          disabled={busy}
+                          value={item.cover === true}
+                          onValueChange={(enabled) =>
+                            setVideos((prev) =>
+                              prev.map((it) => (it.id === item.id ? { ...it, cover: enabled } : it)),
+                            )
+                          }
+                          trackColor={{ false: palette.switchOff, true: accent }}
+                        />
+                      </View>
+                      {item.cover ? (
+                        <>
+                          <TextInput
+                            value={item.coverText ?? ''}
+                            onChangeText={(text) =>
+                              setVideos((prev) => prev.map((it) => (it.id === item.id ? { ...it, coverText: text } : it)))
+                            }
+                            editable={!busy}
+                            placeholder="封面文字，可不填"
+                            placeholderTextColor={palette.placeholder}
+                            multiline
+                            style={styles.itemScript}
+                          />
+                          <Text style={styles.optionHint}>
+                            只对这一条。保存后从成片里挑一张更清楚的高光做封面。横屏视频出横图，竖屏视频出竖图。填了文字会压成黄字黑边的封面大字。
+                          </Text>
+                        </>
+                      ) : null}
                     </>
                   ) : null}
                   {item.message ? (
@@ -769,6 +893,21 @@ export function MediaScreen() {
                     >
                       {item.message}
                     </Text>
+                  ) : null}
+                  {kind === 'video' && (item.status === 'failed' || (item.source === '文件' && item.status !== 'saved')) ? (
+                    <Pressable
+                      disabled={busy || savingOriginalId != null || item.originalSaved}
+                      onPress={() => void saveOriginal(item)}
+                      style={[styles.keepOriginal, (busy || savingOriginalId != null || item.originalSaved) && styles.primaryDisabled]}
+                    >
+                      <Text style={styles.keepOriginalText}>
+                        {item.originalSaved
+                          ? '原视频已保存到相册'
+                          : savingOriginalId === item.id
+                            ? '正在保存原视频…'
+                            : '原视频保存到相册'}
+                      </Text>
+                    </Pressable>
                   ) : null}
                   {kind === 'image' && !busy ? (
                     <Pressable
@@ -813,7 +952,7 @@ export function MediaScreen() {
           )}
         </Pressable>
         <Text style={styles.footerHint}>
-          {picking ? '正在读取…' : '视频一条一条处理，只保存视频到相册。请留在这个页面。'}
+          {picking ? '正在读取…' : '视频一条一条处理。没勾选抽帧和封面的只保存视频。请留在这个页面。'}
         </Text>
       </View>
       {cropOpen && sample ? (
@@ -842,12 +981,14 @@ function createMediaStyles(palette: Palette, accent: string) {
     flexDirection: 'row',
     alignItems: 'center',
     justifyContent: 'space-between',
-    gap: 12,
+    flexWrap: 'wrap',
+    gap: 8,
   },
   titleActions: {
     flexDirection: 'row',
     alignItems: 'center',
-    gap: 16,
+    flexShrink: 0,
+    gap: 12,
   },
   title: {
     color: palette.text,
@@ -1026,6 +1167,22 @@ function createMediaStyles(palette: Palette, accent: string) {
   cardStatus: {
     color: accent,
     fontSize: 13,
+  },
+  keepOriginal: {
+    marginTop: 6,
+    minHeight: 36,
+    paddingHorizontal: 12,
+    borderRadius: 10,
+    alignItems: 'center',
+    justifyContent: 'center',
+    backgroundColor: palette.card,
+    borderWidth: StyleSheet.hairlineWidth,
+    borderColor: accent,
+  },
+  keepOriginalText: {
+    color: accent,
+    fontSize: 14,
+    fontWeight: '600',
   },
   ok: {
     color: '#3DDC97',
