@@ -232,7 +232,7 @@ private enum VideoFlipper {
     }
 
     let composedRange = try await compositionVideoTrack.load(.timeRange)
-    let safeDuration = try alignToFrames(
+    let safeDuration = try await alignToFrames(
       video: compositionVideoTrack,
       audios: [originalAudioTrack, speechTrack],
       duration: CMTimeMinimum(timelineDuration, composedRange.duration)
@@ -374,7 +374,7 @@ private enum VideoFlipper {
         compositionAudio = audio
       }
     }
-    _ = try alignToFrames(video: compositionVideo, audios: [compositionAudio], duration: range.duration)
+    _ = try await alignToFrames(video: compositionVideo, audios: [compositionAudio], duration: range.duration)
     let videoComposition = LookFilter.composition(asset: composition, name: name)
     try await exportVideo(
       composition: composition,
@@ -413,7 +413,7 @@ private enum VideoFlipper {
       try? audio.insertTimeRange(audioRange, of: audioTrack, at: .zero)
       compositionAudio = audio
     }
-    let duration = try alignToFrames(
+    let duration = try await alignToFrames(
       video: compositionVideo,
       audios: [compositionAudio],
       duration: range.duration
