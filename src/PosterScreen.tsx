@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useMemo, useState } from 'react';
 import {
   ActivityIndicator,
   Alert,
@@ -17,7 +17,7 @@ import * as DocumentPicker from 'expo-document-picker';
 import * as MediaLibrary from 'expo-media-library';
 import VideoFlip from '../modules/video-flip';
 import { errorText } from './runtime';
-import { useTheme } from './theme';
+import { useTheme, type Palette } from './theme';
 
 const SAMPLE_SCRIPT = `全网汉堡前五排行榜！看看有没有你的本命🍔
 第5名 华莱士｜汉堡界性价比卷王！十几块直接吃到撑，香辣鸡腿堡经典，学生党夜宵首选，缺点品控看运气
@@ -44,7 +44,8 @@ function baseName(uri: string, fallback: string) {
 
 export function PosterScreen() {
   const insets = useSafeAreaInsets();
-  const { color } = useTheme();
+  const { color, palette } = useTheme();
+  const styles = useMemo(() => createPosterStyles(palette), [palette]);
   const [script, setScript] = useState(SAMPLE_SCRIPT);
   const [background, setBackground] = useState<{ uri: string; name: string } | null>(null);
   const [busy, setBusy] = useState(false);
@@ -135,7 +136,7 @@ export function PosterScreen() {
           value={script}
           onChangeText={setScript}
           placeholder={'一行一句\n第二行接着翻'}
-          placeholderTextColor="#6E8498"
+          placeholderTextColor={palette.placeholder}
           multiline
           editable={!busy}
           style={styles.script}
@@ -167,19 +168,20 @@ export function PosterScreen() {
   );
 }
 
-const styles = StyleSheet.create({
+function createPosterStyles(palette: Palette) {
+  return StyleSheet.create({
   screen: {
     flex: 1,
     paddingHorizontal: 20,
   },
   title: {
-    color: '#F4F7FB',
+    color: palette.text,
     fontSize: 28,
     fontWeight: '700',
   },
   subtitle: {
     marginTop: 8,
-    color: '#9BB0C5',
+    color: palette.muted,
     fontSize: 14,
     lineHeight: 20,
   },
@@ -196,15 +198,15 @@ const styles = StyleSheet.create({
     borderRadius: 12,
     paddingHorizontal: 12,
     paddingVertical: 12,
-    color: '#F4F7FB',
-    backgroundColor: 'rgba(255,255,255,0.08)',
+    color: palette.text,
+    backgroundColor: palette.field,
     fontSize: 16,
     fontWeight: '600',
     textAlignVertical: 'top',
   },
   hint: {
     flex: 1,
-    color: '#9BB0C5',
+    color: palette.muted,
     fontSize: 14,
     lineHeight: 20,
   },
@@ -218,10 +220,10 @@ const styles = StyleSheet.create({
     borderRadius: 12,
     alignItems: 'center',
     justifyContent: 'center',
-    backgroundColor: 'rgba(255,255,255,0.08)',
+    backgroundColor: palette.field,
   },
   secondaryText: {
-    color: '#F4F7FB',
+    color: palette.text,
     fontSize: 15,
     fontWeight: '600',
   },
@@ -247,8 +249,9 @@ const styles = StyleSheet.create({
     opacity: 0.45,
   },
   primaryText: {
-    color: '#F4F7FB',
+    color: '#FFFFFF',
     fontSize: 16,
     fontWeight: '700',
   },
 });
+}

@@ -85,7 +85,6 @@ enum Concat {
     videoComposition.instructions = [instruction]
     videoComposition.renderSize = canvas
     videoComposition.frameDuration = CMTime(value: 1, timescale: 30)
-    videoComposition.sourceTrackIDForFrameTiming = videoTrack.trackID
     applyRec709(videoComposition)
 
     let output = FileManager.default.temporaryDirectory.appendingPathComponent("joined-\(UUID().uuidString).mp4")

@@ -1,4 +1,4 @@
-import { useRef, useState } from 'react';
+import { useMemo, useRef, useState } from 'react';
 import {
   ActivityIndicator,
   Alert,
@@ -30,7 +30,7 @@ import {
   runWithLimit,
   watermarkPayload,
 } from './runtime';
-import { useTheme } from './theme';
+import { useTheme, type Palette } from './theme';
 
 type Origin = '搜索' | '相册' | '文件';
 
@@ -259,7 +259,8 @@ async function searchImages(engine: Engine, query: string, page: number) {
 
 export function SearchScreen() {
   const insets = useSafeAreaInsets();
-  const { color: accent } = useTheme();
+  const { color: accent, palette } = useTheme();
+  const styles = useMemo(() => createSearchStyles(palette, accent), [palette, accent]);
   const [query, setQuery] = useState('');
   const [engine, setEngine] = useState<Engine>('baidu');
   const [logs, setLogs] = useState<string[]>([]);
@@ -502,7 +503,7 @@ export function SearchScreen() {
             style={[styles.engineChip, engine === item.id && styles.engineChipOn, engine === item.id && { backgroundColor: accent }]}
             onPress={() => setEngine(item.id)}
           >
-            <Text style={styles.engineText}>{item.label}</Text>
+            <Text style={[styles.engineText, engine === item.id && styles.onAccentText]}>{item.label}</Text>
           </Pressable>
         ))}
       </View>
@@ -511,7 +512,7 @@ export function SearchScreen() {
           value={query}
           onChangeText={setQuery}
           placeholder="关键词"
-          placeholderTextColor="#6E8498"
+          placeholderTextColor={palette.placeholder}
           style={styles.input}
           returnKeyType="search"
           onSubmitEditing={() => void runSearch(1)}
@@ -544,7 +545,7 @@ export function SearchScreen() {
             <Switch
               value={batch}
               onValueChange={setBatch}
-              trackColor={{ false: 'rgba(255,255,255,0.15)', true: accent }}
+              trackColor={{ false: palette.switchOff, true: accent }}
             />
           </View>
           <View style={styles.optionRow}>
@@ -552,7 +553,7 @@ export function SearchScreen() {
             <Switch
               value={flip}
               onValueChange={setFlip}
-              trackColor={{ false: 'rgba(255,255,255,0.15)', true: accent }}
+              trackColor={{ false: palette.switchOff, true: accent }}
             />
           </View>
           <Text style={styles.optionHint}>
@@ -679,19 +680,20 @@ export function SearchScreen() {
   );
 }
 
-const styles = StyleSheet.create({
+function createSearchStyles(palette: Palette, accent: string) {
+  return StyleSheet.create({
   screen: {
     flex: 1,
     paddingHorizontal: 16,
   },
   title: {
-    color: '#F4F7FB',
+    color: palette.text,
     fontSize: 28,
     fontWeight: '700',
   },
   subtitle: {
     marginTop: 6,
-    color: '#9BB0C5',
+    color: palette.muted,
     fontSize: 14,
     lineHeight: 20,
   },
@@ -705,8 +707,8 @@ const styles = StyleSheet.create({
     minHeight: 44,
     borderRadius: 12,
     paddingHorizontal: 12,
-    color: '#F4F7FB',
-    backgroundColor: 'rgba(255,255,255,0.08)',
+    color: palette.text,
+    backgroundColor: palette.field,
     fontSize: 16,
   },
   searchButton: {
@@ -717,7 +719,7 @@ const styles = StyleSheet.create({
     backgroundColor: '#1F6FEB',
   },
   searchText: {
-    color: '#F4F7FB',
+    color: '#FFFFFF',
     fontSize: 16,
     fontWeight: '700',
   },
@@ -733,13 +735,16 @@ const styles = StyleSheet.create({
     borderRadius: 16,
     alignItems: 'center',
     justifyContent: 'center',
-    backgroundColor: 'rgba(255,255,255,0.08)',
+    backgroundColor: palette.field,
   },
   engineChipOn: {
     backgroundColor: '#1F6FEB',
   },
+  onAccentText: {
+    color: '#FFFFFF',
+  },
   engineText: {
-    color: '#F4F7FB',
+    color: palette.text,
     fontSize: 13,
     fontWeight: '700',
   },
@@ -747,7 +752,9 @@ const styles = StyleSheet.create({
     marginTop: 10,
     borderRadius: 12,
     padding: 10,
-    backgroundColor: 'rgba(255,255,255,0.06)',
+    backgroundColor: palette.card,
+    borderWidth: StyleSheet.hairlineWidth,
+    borderColor: palette.line,
     gap: 8,
   },
   logHead: {
@@ -774,7 +781,9 @@ const styles = StyleSheet.create({
   },
   optionCard: {
     borderRadius: 12,
-    backgroundColor: 'rgba(255,255,255,0.06)',
+    backgroundColor: palette.card,
+    borderWidth: StyleSheet.hairlineWidth,
+    borderColor: palette.line,
     paddingHorizontal: 12,
     paddingVertical: 8,
   },
@@ -785,11 +794,11 @@ const styles = StyleSheet.create({
     justifyContent: 'space-between',
   },
   optionLabel: {
-    color: '#F4F7FB',
+    color: palette.text,
     fontSize: 15,
   },
   optionHint: {
-    color: '#9BB0C5',
+    color: palette.muted,
     fontSize: 12,
     lineHeight: 18,
     marginBottom: 4,
@@ -804,17 +813,17 @@ const styles = StyleSheet.create({
     borderRadius: 12,
     alignItems: 'center',
     justifyContent: 'center',
-    backgroundColor: 'rgba(255,255,255,0.08)',
+    backgroundColor: palette.field,
   },
   secondaryWide: {
     minHeight: 44,
     borderRadius: 12,
     alignItems: 'center',
     justifyContent: 'center',
-    backgroundColor: 'rgba(255,255,255,0.08)',
+    backgroundColor: palette.field,
   },
   secondaryText: {
-    color: '#F4F7FB',
+    color: palette.text,
     fontSize: 15,
     fontWeight: '600',
   },
@@ -823,7 +832,7 @@ const styles = StyleSheet.create({
     gap: 12,
   },
   link: {
-    color: '#8EB6FF',
+    color: accent,
     fontSize: 14,
   },
   disabled: {
@@ -835,11 +844,11 @@ const styles = StyleSheet.create({
     justifyContent: 'space-between',
   },
   pageText: {
-    color: '#9BB0C5',
+    color: palette.muted,
     fontSize: 13,
   },
   empty: {
-    color: '#9BB0C5',
+    color: palette.muted,
     fontSize: 14,
     lineHeight: 20,
   },
@@ -855,10 +864,10 @@ const styles = StyleSheet.create({
     overflow: 'hidden',
     borderWidth: 2,
     borderColor: 'transparent',
-    backgroundColor: 'rgba(255,255,255,0.06)',
+    backgroundColor: palette.card,
   },
   cellOn: {
-    borderColor: '#8EB6FF',
+    borderColor: accent,
   },
   thumb: {
     width: '100%',
@@ -868,7 +877,7 @@ const styles = StyleSheet.create({
     position: 'absolute',
     left: 6,
     top: 6,
-    color: '#F4F7FB',
+    color: palette.text,
     backgroundColor: 'rgba(31,111,235,0.9)',
     overflow: 'hidden',
     borderRadius: 6,
@@ -887,7 +896,7 @@ const styles = StyleSheet.create({
   },
   localName: {
     flex: 1,
-    color: '#F4F7FB',
+    color: palette.text,
     fontSize: 13,
   },
   remove: {
@@ -895,7 +904,7 @@ const styles = StyleSheet.create({
     fontSize: 13,
   },
   statusLine: {
-    color: '#9BB0C5',
+    color: palette.muted,
     fontSize: 12,
     lineHeight: 18,
   },
@@ -912,7 +921,7 @@ const styles = StyleSheet.create({
     backgroundColor: '#1F6FEB',
   },
   primaryText: {
-    color: '#F4F7FB',
+    color: '#FFFFFF',
     fontSize: 16,
     fontWeight: '700',
   },
@@ -933,3 +942,4 @@ const styles = StyleSheet.create({
     fontSize: 14,
   },
 });
+}

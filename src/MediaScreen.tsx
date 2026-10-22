@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useMemo, useState } from 'react';
 import {
   ActivityIndicator,
   Alert,
@@ -20,7 +20,7 @@ import VideoFlip from '../modules/video-flip';
 import { CropEditor } from './CropEditor';
 import { MergeScreen } from './MergeScreen';
 import { WatermarkForm } from './WatermarkForm';
-import { useTheme } from './theme';
+import { useTheme, type Palette } from './theme';
 import {
   CropNorm,
   ItemStatus,
@@ -83,14 +83,14 @@ function formatDuration(durationMs?: number) {
 
 export function MediaScreen() {
   const insets = useSafeAreaInsets();
-  const { color: accent } = useTheme();
+  const { color: accent, palette } = useTheme();
+  const styles = useMemo(() => createMediaStyles(palette, accent), [palette, accent]);
   const [kind, setKind] = useState<Kind>('video');
   const [videos, setVideos] = useState<MediaItem[]>([]);
   const [images, setImages] = useState<MediaItem[]>([]);
   const [watermark, setWatermark] = useState<WatermarkSettings>(defaultWatermark);
   const [zoom, setZoom] = useState(1);
   const [subtitleScript, setSubtitleScript] = useState('');
-  const [sampleFrames, setSampleFrames] = useState(false);
   const [useCurrentClip, setUseCurrentClip] = useState(true);
   const [extendVideo, setExtendVideo] = useState(false);
   const [clipStart, setClipStart] = useState('3');
@@ -268,7 +268,6 @@ export function MediaScreen() {
         filterOn ||
         extendVideo ||
         followOn ||
-        sampleFrames ||
         zoom > 1 ||
         subtitleScript.trim().length > 0);
 
@@ -280,12 +279,11 @@ export function MediaScreen() {
     const mark = watermarkPayload(watermark);
     const subtitleLines = subtitleScript.split(/\r?\n/);
 
-    await runWithLimit(queue, heavy ? 1 : 2, async (item) => {
+    await runWithLimit(queue, kind === 'video' || heavy ? 1 : 2, async (item) => {
       setItems((prev) =>
         prev.map((it) => (it.id === item.id ? { ...it, status: 'processing', message: '正在处理…' } : it)),
       );
       let outputUri = '';
-      let frameUris: string[] = [];
       try {
         outputUri =
           kind === 'video'
@@ -314,13 +312,6 @@ export function MediaScreen() {
           VideoFlip.removeTempFile(outputUri);
           outputUri = joined;
         }
-        if (kind === 'video' && sampleFrames) {
-          try {
-            frameUris = await VideoFlip.sampleFrames(outputUri, 4);
-          } catch {
-            frameUris = [];
-          }
-        }
         setItems((prev) =>
           prev.map((it) => (it.id === item.id ? { ...it, status: 'saving', message: '等待写入相册…' } : it)),
         );
@@ -328,14 +319,6 @@ export function MediaScreen() {
           setItems((prev) =>
             prev.map((it) => (it.id === item.id ? { ...it, status: 'saving', message: '正在保存到相册…' } : it)),
           );
-          for (const frame of frameUris) {
-            try {
-              await MediaLibrary.createAssetAsync(frame);
-            } catch {
-              // 抽帧失败不影响视频本身保存。
-            }
-            VideoFlip.removeTempFile(frame);
-          }
           await MediaLibrary.createAssetAsync(outputUri);
         });
         saved += 1;
@@ -345,7 +328,7 @@ export function MediaScreen() {
               ? {
                   ...it,
                   status: 'saved',
-                  message: frameUris.length > 0 ? `已保存到相册，并抽出 ${frameUris.length} 张` : '已保存到相册',
+                  message: '已保存到相册',
                 }
               : it,
           ),
@@ -356,7 +339,6 @@ export function MediaScreen() {
           prev.map((it) => (it.id === item.id ? { ...it, status: 'failed', message: errorText(error) } : it)),
         );
       } finally {
-        for (const frame of frameUris) VideoFlip.removeTempFile(frame);
         if (outputUri) VideoFlip.removeTempFile(outputUri);
       }
     });
@@ -379,7 +361,6 @@ export function MediaScreen() {
     setWatermark(defaultWatermark);
     setZoom(1);
     setSubtitleScript('');
-    setSampleFrames(false);
     setUseCurrentClip(true);
     setExtendVideo(false);
     setClipStart('3');
@@ -455,10 +436,10 @@ export function MediaScreen() {
       </Text>
       <View style={styles.segment}>
         <Pressable style={[styles.segmentItem, kind === 'video' && styles.segmentOn]} onPress={() => setKind('video')}>
-          <Text style={styles.segmentText}>视频</Text>
+          <Text style={[styles.segmentText, kind === 'video' && styles.onAccentText]}>视频</Text>
         </Pressable>
         <Pressable style={[styles.segmentItem, kind === 'image' && styles.segmentOn]} onPress={() => setKind('image')}>
-          <Text style={styles.segmentText}>图片</Text>
+          <Text style={[styles.segmentText, kind === 'image' && styles.onAccentText]}>图片</Text>
         </Pressable>
       </View>
       <ScrollView style={styles.list} contentContainerStyle={styles.listContent}>
@@ -472,7 +453,7 @@ export function MediaScreen() {
                   style={[styles.zoomChip, zoom === value && styles.zoomChipOn, zoom === value && { backgroundColor: accent }]}
                   onPress={() => setZoom(value)}
                 >
-                  <Text style={styles.zoomText}>{value === 1 ? '不放大' : `${value}`}</Text>
+                  <Text style={[styles.zoomText, zoom === value && styles.onAccentText]}>{value === 1 ? '不放大' : `${value}`}</Text>
                 </Pressable>
               ))}
             </View>
@@ -481,7 +462,7 @@ export function MediaScreen() {
               value={subtitleScript}
               onChangeText={setSubtitleScript}
               placeholder={'一行对应一个视频\n第二行给第二个视频'}
-              placeholderTextColor="#6E8498"
+              placeholderTextColor={palette.placeholder}
               multiline
               style={styles.script}
             />
@@ -489,19 +470,11 @@ export function MediaScreen() {
               空行表示该视频不加字幕。有字的视频会用系统中文男声解说，字幕和声音一起出现，原声在解说期间变小。
             </Text>
             <View style={styles.optionRow}>
-              <Text style={styles.optionLabel}>随机抽帧</Text>
-              <Switch
-                value={sampleFrames}
-                onValueChange={setSampleFrames}
-                trackColor={{ false: 'rgba(255,255,255,0.15)', true: accent }}
-              />
-            </View>
-            <View style={styles.optionRow}>
               <Text style={styles.optionLabel}>延长视频</Text>
               <Switch
                 value={extendVideo}
                 onValueChange={setExtendVideo}
-                trackColor={{ false: 'rgba(255,255,255,0.15)', true: accent }}
+                trackColor={{ false: palette.switchOff, true: accent }}
               />
             </View>
             {extendVideo ? (
@@ -511,7 +484,7 @@ export function MediaScreen() {
                   <Switch
                     value={useCurrentClip}
                     onValueChange={setUseCurrentClip}
-                    trackColor={{ false: 'rgba(255,255,255,0.15)', true: accent }}
+                    trackColor={{ false: palette.switchOff, true: accent }}
                   />
                 </View>
                 <View style={styles.timeRow}>
@@ -535,7 +508,7 @@ export function MediaScreen() {
                       style={[styles.zoomChip, highlightMode === mode && styles.zoomChipOn, highlightMode === mode && { backgroundColor: accent }]}
                       onPress={() => setHighlightMode(mode)}
                     >
-                      <Text style={styles.zoomText}>{label}</Text>
+                      <Text style={[styles.zoomText, highlightMode === mode && styles.onAccentText]}>{label}</Text>
                     </Pressable>
                   ))}
                 </View>
@@ -549,7 +522,7 @@ export function MediaScreen() {
               <Switch
                 value={filterOn}
                 onValueChange={setFilterOn}
-                trackColor={{ false: 'rgba(255,255,255,0.15)', true: accent }}
+                trackColor={{ false: palette.switchOff, true: accent }}
               />
             </View>
             {filterOn ? (
@@ -567,7 +540,7 @@ export function MediaScreen() {
                     style={[styles.zoomChip, filterName === name && styles.zoomChipOn, filterName === name && { backgroundColor: accent }]}
                     onPress={() => setFilterName(name)}
                   >
-                    <Text style={styles.zoomText}>{label}</Text>
+                    <Text style={[styles.zoomText, filterName === name && styles.onAccentText]}>{label}</Text>
                   </Pressable>
                 ))}
               </View>
@@ -578,7 +551,7 @@ export function MediaScreen() {
               <Switch
                 value={followOn}
                 onValueChange={setFollowOn}
-                trackColor={{ false: 'rgba(255,255,255,0.15)', true: accent }}
+                trackColor={{ false: palette.switchOff, true: accent }}
               />
             </View>
             {followOn ? (
@@ -608,7 +581,7 @@ export function MediaScreen() {
               <Switch
                 value={flipImages}
                 onValueChange={setFlipImages}
-                trackColor={{ false: 'rgba(255,255,255,0.15)', true: accent }}
+                trackColor={{ false: palette.switchOff, true: accent }}
               />
             </View>
             <View style={styles.optionRow}>
@@ -724,7 +697,7 @@ export function MediaScreen() {
           )}
         </Pressable>
         <Text style={styles.footerHint}>
-          {picking ? '正在读取…' : '最多同时处理 2 个，保存到相册会排队。请留在这个页面。'}
+          {picking ? '正在读取…' : '视频一条一条处理，只保存视频到相册。请留在这个页面。'}
         </Text>
       </View>
       {cropOpen && sample ? (
@@ -743,7 +716,8 @@ export function MediaScreen() {
   );
 }
 
-const styles = StyleSheet.create({
+function createMediaStyles(palette: Palette, accent: string) {
+  return StyleSheet.create({
   screen: {
     flex: 1,
     paddingHorizontal: 20,
@@ -760,13 +734,13 @@ const styles = StyleSheet.create({
     gap: 16,
   },
   title: {
-    color: '#F4F7FB',
+    color: palette.text,
     fontSize: 28,
     fontWeight: '700',
   },
   subtitle: {
     marginTop: 8,
-    color: '#9BB0C5',
+    color: palette.muted,
     fontSize: 14,
     lineHeight: 20,
   },
@@ -774,7 +748,9 @@ const styles = StyleSheet.create({
     marginTop: 14,
     flexDirection: 'row',
     borderRadius: 12,
-    backgroundColor: 'rgba(255,255,255,0.06)',
+    backgroundColor: palette.card,
+    borderWidth: StyleSheet.hairlineWidth,
+    borderColor: palette.line,
     padding: 4,
   },
   segmentItem: {
@@ -788,7 +764,7 @@ const styles = StyleSheet.create({
     backgroundColor: '#1F6FEB',
   },
   segmentText: {
-    color: '#F4F7FB',
+    color: palette.text,
     fontSize: 15,
     fontWeight: '700',
   },
@@ -802,7 +778,9 @@ const styles = StyleSheet.create({
   },
   optionCard: {
     borderRadius: 12,
-    backgroundColor: 'rgba(255,255,255,0.06)',
+    backgroundColor: palette.card,
+    borderWidth: StyleSheet.hairlineWidth,
+    borderColor: palette.line,
     paddingHorizontal: 12,
     paddingVertical: 8,
     gap: 6,
@@ -814,11 +792,11 @@ const styles = StyleSheet.create({
     justifyContent: 'space-between',
   },
   optionLabel: {
-    color: '#F4F7FB',
+    color: palette.text,
     fontSize: 15,
   },
   optionHint: {
-    color: '#9BB0C5',
+    color: palette.muted,
     fontSize: 12,
     lineHeight: 18,
   },
@@ -832,13 +810,13 @@ const styles = StyleSheet.create({
     borderRadius: 9,
     alignItems: 'center',
     justifyContent: 'center',
-    backgroundColor: 'rgba(255,255,255,0.08)',
+    backgroundColor: palette.field,
   },
   zoomChipOn: {
     backgroundColor: '#1F6FEB',
   },
   zoomText: {
-    color: '#F4F7FB',
+    color: palette.text,
     fontSize: 14,
     fontWeight: '700',
   },
@@ -847,8 +825,8 @@ const styles = StyleSheet.create({
     borderRadius: 10,
     paddingHorizontal: 12,
     paddingVertical: 10,
-    color: '#F4F7FB',
-    backgroundColor: 'rgba(255,255,255,0.08)',
+    color: palette.text,
+    backgroundColor: palette.field,
     fontSize: 15,
     textAlignVertical: 'top',
   },
@@ -865,8 +843,8 @@ const styles = StyleSheet.create({
     minHeight: 36,
     borderRadius: 8,
     paddingHorizontal: 8,
-    color: '#F4F7FB',
-    backgroundColor: 'rgba(255,255,255,0.08)',
+    color: palette.text,
+    backgroundColor: palette.field,
     fontSize: 15,
   },
   actions: {
@@ -879,10 +857,10 @@ const styles = StyleSheet.create({
     borderRadius: 12,
     alignItems: 'center',
     justifyContent: 'center',
-    backgroundColor: 'rgba(255,255,255,0.08)',
+    backgroundColor: palette.field,
   },
   secondaryText: {
-    color: '#F4F7FB',
+    color: palette.text,
     fontSize: 15,
     fontWeight: '600',
   },
@@ -892,16 +870,16 @@ const styles = StyleSheet.create({
     justifyContent: 'space-between',
   },
   listTitle: {
-    color: '#F4F7FB',
+    color: palette.text,
     fontSize: 15,
     fontWeight: '600',
   },
   link: {
-    color: '#8EB6FF',
+    color: accent,
     fontSize: 14,
   },
   empty: {
-    color: '#9BB0C5',
+    color: palette.muted,
     fontSize: 15,
   },
   card: {
@@ -911,23 +889,25 @@ const styles = StyleSheet.create({
     paddingHorizontal: 14,
     paddingVertical: 12,
     borderRadius: 12,
-    backgroundColor: 'rgba(255,255,255,0.06)',
+    backgroundColor: palette.card,
+    borderWidth: StyleSheet.hairlineWidth,
+    borderColor: palette.line,
   },
   cardBody: {
     flex: 1,
     gap: 4,
   },
   cardName: {
-    color: '#F4F7FB',
+    color: palette.text,
     fontSize: 15,
     fontWeight: '600',
   },
   cardMeta: {
-    color: '#9BB0C5',
+    color: palette.muted,
     fontSize: 13,
   },
   cardStatus: {
-    color: '#8EB6FF',
+    color: accent,
     fontSize: 13,
   },
   ok: {
@@ -941,7 +921,7 @@ const styles = StyleSheet.create({
     fontSize: 14,
   },
   summary: {
-    color: '#F4F7FB',
+    color: palette.text,
     fontSize: 14,
     marginBottom: 8,
   },
@@ -960,15 +940,19 @@ const styles = StyleSheet.create({
     opacity: 0.45,
   },
   primaryText: {
-    color: '#F4F7FB',
+    color: '#FFFFFF',
     fontSize: 17,
     fontWeight: '700',
   },
+  onAccentText: {
+    color: '#FFFFFF',
+  },
   footerHint: {
     marginTop: 8,
-    color: '#9BB0C5',
+    color: palette.muted,
     fontSize: 12,
     lineHeight: 18,
     textAlign: 'center',
   },
 });
+}

@@ -1,6 +1,7 @@
+import { useMemo } from 'react';
 import { Pressable, StyleSheet, Switch, Text, TextInput, View } from 'react-native';
 import { WatermarkSettings } from './runtime';
-import { useTheme } from './theme';
+import { useTheme, type Palette } from './theme';
 
 type Props = {
   value: WatermarkSettings;
@@ -8,7 +9,8 @@ type Props = {
 };
 
 export function WatermarkForm({ value, onChange }: Props) {
-  const { color: accent } = useTheme();
+  const { color: accent, palette } = useTheme();
+  const styles = useMemo(() => createWatermarkStyles(palette), [palette]);
   const patch = (part: Partial<WatermarkSettings>) => onChange({ ...value, ...part });
 
   return (
@@ -18,7 +20,7 @@ export function WatermarkForm({ value, onChange }: Props) {
         <Switch
           value={value.enabled}
           onValueChange={(enabled) => patch({ enabled })}
-          trackColor={{ false: 'rgba(255,255,255,0.15)', true: accent }}
+          trackColor={{ false: palette.switchOff, true: accent }}
         />
       </View>
       {value.enabled ? (
@@ -27,7 +29,7 @@ export function WatermarkForm({ value, onChange }: Props) {
             value={value.text}
             onChangeText={(text) => patch({ text })}
             placeholder="南方小猴子"
-            placeholderTextColor="#6E8498"
+            placeholderTextColor={palette.placeholder}
             style={styles.input}
           />
           <Stepper
@@ -47,7 +49,7 @@ export function WatermarkForm({ value, onChange }: Props) {
             <Switch
               value={value.move}
               onValueChange={(move) => patch({ move })}
-              trackColor={{ false: 'rgba(255,255,255,0.15)', true: accent }}
+              trackColor={{ false: palette.switchOff, true: accent }}
             />
           </View>
           <View style={styles.row}>
@@ -55,7 +57,7 @@ export function WatermarkForm({ value, onChange }: Props) {
             <Switch
               value={value.placeLeft}
               onValueChange={(placeLeft) => patch({ placeLeft })}
-              trackColor={{ false: 'rgba(255,255,255,0.15)', true: accent }}
+              trackColor={{ false: palette.switchOff, true: accent }}
             />
           </View>
           <View style={styles.row}>
@@ -63,7 +65,7 @@ export function WatermarkForm({ value, onChange }: Props) {
             <Switch
               value={value.placeCenter}
               onValueChange={(placeCenter) => patch({ placeCenter })}
-              trackColor={{ false: 'rgba(255,255,255,0.15)', true: accent }}
+              trackColor={{ false: palette.switchOff, true: accent }}
             />
           </View>
           <Text style={styles.hint}>默认不加水印。勾选后文字在左边和中央，颜色很淡，并轻微挪动。</Text>
@@ -84,6 +86,8 @@ function Stepper({
   onMinus: () => void;
   onPlus: () => void;
 }) {
+  const { palette } = useTheme();
+  const styles = useMemo(() => createWatermarkStyles(palette), [palette]);
   return (
     <View style={styles.row}>
       <Text style={styles.sub}>{label}</Text>
@@ -100,11 +104,14 @@ function Stepper({
   );
 }
 
-const styles = StyleSheet.create({
+function createWatermarkStyles(palette: Palette) {
+  return StyleSheet.create({
   box: {
     marginTop: 12,
     borderRadius: 12,
-    backgroundColor: 'rgba(255,255,255,0.06)',
+    backgroundColor: palette.card,
+    borderWidth: StyleSheet.hairlineWidth,
+    borderColor: palette.line,
     paddingHorizontal: 12,
     paddingVertical: 8,
   },
@@ -119,24 +126,24 @@ const styles = StyleSheet.create({
     justifyContent: 'space-between',
   },
   label: {
-    color: '#F4F7FB',
+    color: palette.text,
     fontSize: 16,
     fontWeight: '600',
   },
   sub: {
-    color: '#F4F7FB',
+    color: palette.text,
     fontSize: 15,
   },
   input: {
     minHeight: 42,
     borderRadius: 10,
     paddingHorizontal: 12,
-    color: '#F4F7FB',
-    backgroundColor: 'rgba(255,255,255,0.08)',
+    color: palette.text,
+    backgroundColor: palette.field,
     fontSize: 16,
   },
   hint: {
-    color: '#9BB0C5',
+    color: palette.muted,
     fontSize: 12,
     lineHeight: 18,
   },
@@ -151,17 +158,18 @@ const styles = StyleSheet.create({
     borderRadius: 8,
     alignItems: 'center',
     justifyContent: 'center',
-    backgroundColor: 'rgba(255,255,255,0.1)',
+    backgroundColor: palette.field,
   },
   stepText: {
-    color: '#F4F7FB',
+    color: palette.text,
     fontSize: 18,
     fontWeight: '700',
   },
   stepValue: {
     minWidth: 48,
     textAlign: 'center',
-    color: '#F4F7FB',
+    color: palette.text,
     fontSize: 15,
   },
 });
+}

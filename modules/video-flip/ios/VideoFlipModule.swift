@@ -150,41 +150,45 @@ private enum VideoFlipper {
       throw VideoFlipError.noVideoTrack
     }
 
+    let composedRange = try await compositionVideoTrack.load(.timeRange)
+    var safeDuration = CMTimeMinimum(timelineDuration, composedRange.duration)
+    let oneFrame = CMTime(value: 1, timescale: 30)
+    if CMTimeCompare(safeDuration, CMTimeMultiply(oneFrame, multiplier: 3)) > 0 {
+      safeDuration = CMTimeSubtract(safeDuration, oneFrame)
+    }
     let instruction = AVMutableVideoCompositionInstruction()
-    instruction.timeRange = CMTimeRange(start: .zero, duration: timelineDuration)
+    instruction.timeRange = CMTimeRange(start: .zero, duration: safeDuration)
 
     let layerInstruction = AVMutableVideoCompositionLayerInstruction(assetTrack: compositionVideoTrack)
     layerInstruction.setTransform(transform, at: .zero)
     if let replay = timeline.replayRange {
-      let zoomed = zoom(transform, renderSize: renderSize, scale: 1.25)
-      layerInstruction.setTransformRamp(fromStart: transform, toEnd: zoomed, timeRange: replay)
-      layerInstruction.setTransform(transform, at: CMTimeAdd(replay.start, replay.duration))
+      let replayEnd = CMTimeAdd(replay.start, replay.duration)
+      if CMTimeCompare(replay.start, .zero) >= 0, CMTimeCompare(replayEnd, safeDuration) <= 0 {
+        let zoomed = zoom(transform, renderSize: renderSize, scale: 1.25)
+        layerInstruction.setTransformRamp(fromStart: transform, toEnd: zoomed, timeRange: replay)
+        layerInstruction.setTransform(transform, at: replayEnd)
+      }
     }
     instruction.layerInstructions = [layerInstruction]
 
-    let rawFps = try await videoTrack.load(.nominalFrameRate)
-    let fps: Float = (rawFps.isFinite && rawFps > 1 && rawFps <= 120) ? rawFps : 30 as Float
     let videoComposition = AVMutableVideoComposition()
     videoComposition.instructions = [instruction]
     videoComposition.renderSize = renderSize
-    videoComposition.frameDuration = CMTime(value: 1, timescale: CMTimeScale(Int(fps.rounded())))
+    videoComposition.frameDuration = CMTime(value: 1, timescale: 30)
     let filterName = Self.filterName(from: options)
     let overlay = Self.needsOverlay(options: options, subtitle: subtitle)
     if filterName.isEmpty {
       WatermarkBurner.apply(
         to: videoComposition,
         renderSize: renderSize,
-        duration: timelineDuration.seconds,
+        duration: safeDuration.seconds,
         options: options,
         subtitle: subtitle,
         speechDuration: speechDuration
       )
     }
-    // 水印和字幕会挂上动画层。这时再指定帧时间轨道，导出会直接失败。
-    // 纯翻转不改色彩，避免影响已经可用的镜像导出。
-    if videoComposition.animationTool == nil {
-      videoComposition.sourceTrackIDForFrameTiming = compositionVideoTrack.trackID
-    } else {
+    // 不跟原片的采样点走。Instagram 这类视频采样不连续，跟着走会报 Invalid sample cursor。
+    if videoComposition.animationTool != nil {
       applyRec709(videoComposition)
     }
 
@@ -395,7 +399,7 @@ private enum VideoFlipper {
       exportSession.outputFileType = .mp4
       exportSession.videoComposition = videoComposition
       exportSession.audioMix = audioMix
-      exportSession.shouldOptimizeForNetworkUse = true
+      exportSession.shouldOptimizeForNetworkUse = false
       let failure: String? = await withCheckedContinuation { continuation in
         exportSession.exportAsynchronously {
           switch exportSession.status {
@@ -426,6 +430,9 @@ private enum VideoFlipper {
     }
     let ns = error as NSError
     if ns.domain == AVFoundationErrorDomain {
+      if ns.code == -11880 {
+        return "这个视频的画面时间不连续，系统没法按原样翻转（-11880）"
+      }
       return "\(error.localizedDescription)（\(ns.code)）"
     }
     return error.localizedDescription

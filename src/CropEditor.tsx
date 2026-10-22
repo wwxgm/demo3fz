@@ -13,7 +13,7 @@ import {
 } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { CropNorm } from './runtime';
-import { useTheme } from './theme';
+import { useTheme, type Palette } from './theme';
 
 type Props = {
   uri: string;
@@ -46,7 +46,8 @@ function clampCrop(crop: CropNorm): CropNorm {
 
 export function CropEditor({ uri, initial, onCancel, onConfirm }: Props) {
   const insets = useSafeAreaInsets();
-  const { color: accent } = useTheme();
+  const { color: accent, palette } = useTheme();
+  const styles = useMemo(() => createCropStyles(palette, accent), [palette, accent]);
   const [pixel, setPixel] = useState({ width: 0, height: 0 });
   const [stage, setStage] = useState({ width: 0, height: 0 });
   const [crop, setCrop] = useState<CropNorm>(initial ?? { x: 0.1, y: 0.1, width: 0.8, height: 0.8 });
@@ -208,20 +209,21 @@ export function CropEditor({ uri, initial, onCancel, onConfirm }: Props) {
   );
 }
 
-const styles = StyleSheet.create({
+function createCropStyles(palette: Palette, accent: string) {
+  return StyleSheet.create({
   screen: {
     flex: 1,
-    backgroundColor: '#0B1F33',
+    backgroundColor: palette.background,
     paddingHorizontal: 16,
   },
   title: {
-    color: '#F4F7FB',
+    color: palette.text,
     fontSize: 22,
     fontWeight: '700',
   },
   hint: {
     marginTop: 8,
-    color: '#9BB0C5',
+    color: palette.muted,
     fontSize: 13,
     lineHeight: 18,
   },
@@ -230,7 +232,7 @@ const styles = StyleSheet.create({
     marginTop: 12,
     borderRadius: 12,
     overflow: 'hidden',
-    backgroundColor: '#071521',
+    backgroundColor: palette.bar,
   },
   image: {
     width: '100%',
@@ -280,7 +282,7 @@ const styles = StyleSheet.create({
     width: 28,
     height: 28,
     borderRadius: 14,
-    backgroundColor: '#1F6FEB',
+    backgroundColor: accent,
     borderWidth: 2,
     borderColor: '#F4F7FB',
   },
@@ -294,7 +296,7 @@ const styles = StyleSheet.create({
     gap: 8,
   },
   sizeLabel: {
-    color: '#9BB0C5',
+    color: palette.muted,
     fontSize: 13,
   },
   sizeInput: {
@@ -302,8 +304,8 @@ const styles = StyleSheet.create({
     minHeight: 40,
     borderRadius: 10,
     paddingHorizontal: 10,
-    color: '#F4F7FB',
-    backgroundColor: 'rgba(255,255,255,0.08)',
+    color: palette.text,
+    backgroundColor: palette.field,
   },
   actions: {
     flexDirection: 'row',
@@ -316,10 +318,10 @@ const styles = StyleSheet.create({
     borderRadius: 12,
     alignItems: 'center',
     justifyContent: 'center',
-    backgroundColor: 'rgba(255,255,255,0.08)',
+    backgroundColor: palette.field,
   },
   secondaryText: {
-    color: '#F4F7FB',
+    color: palette.text,
     fontSize: 16,
     fontWeight: '600',
   },
@@ -332,8 +334,9 @@ const styles = StyleSheet.create({
     backgroundColor: '#1F6FEB',
   },
   primaryText: {
-    color: '#F4F7FB',
+    color: '#FFFFFF',
     fontSize: 16,
     fontWeight: '700',
   },
 });
+}

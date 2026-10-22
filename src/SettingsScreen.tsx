@@ -2,11 +2,11 @@ import { useState } from 'react';
 import { ActivityIndicator, Alert, Pressable, ScrollView, StyleSheet, Text, View } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import VideoFlip from '../modules/video-flip';
-import { themeColors, useTheme } from './theme';
+import { themeColors, useTheme, type Appearance } from './theme';
 
 export function SettingsScreen() {
   const insets = useSafeAreaInsets();
-  const { color, setColor } = useTheme();
+  const { color, setColor, appearance, setAppearance, palette } = useTheme();
   const [clearing, setClearing] = useState(false);
 
   const clearCache = () => {
@@ -26,27 +26,62 @@ export function SettingsScreen() {
 
   return (
     <View style={[styles.screen, { paddingTop: insets.top + 8 }]}>
-      <Text style={styles.title}>设置</Text>
-      <Text style={styles.subtitle}>只清理处理过程中留下的临时文件，不会删除相册。</Text>
+      <Text style={[styles.title, { color: palette.text }]}>设置</Text>
+      <Text style={[styles.subtitle, { color: palette.muted }]}>夜间是深色，白天是白底。主题色只改按钮和开关。</Text>
       <ScrollView contentContainerStyle={styles.list}>
-        <Pressable style={styles.row} disabled={clearing} onPress={clearCache}>
+        <View style={[styles.row, { backgroundColor: palette.card, borderColor: palette.line }]}>
+          <View style={styles.themeBlock}>
+            <Text style={[styles.rowTitle, { color: palette.text }]}>外观</Text>
+            <Text style={[styles.rowHint, { color: palette.muted }]}>夜间适合晚上，白天是白色页面</Text>
+            <View style={styles.modes}>
+              {(
+                [
+                  ['dark', '夜间'],
+                  ['light', '白天'],
+                ] as const
+              ).map(([id, label]) => {
+                const selected = appearance === id;
+                return (
+                  <Pressable
+                    key={id}
+                    style={[styles.mode, { backgroundColor: selected ? color : palette.field }]}
+                    onPress={() => setAppearance(id as Appearance)}
+                  >
+                    <Text style={[styles.modeText, { color: selected ? '#FFFFFF' : palette.text }]}>{label}</Text>
+                  </Pressable>
+                );
+              })}
+            </View>
+          </View>
+        </View>
+        <Pressable
+          style={[styles.row, { backgroundColor: palette.card, borderColor: palette.line }]}
+          disabled={clearing}
+          onPress={clearCache}
+        >
           <View style={styles.rowBody}>
-            <Text style={styles.rowTitle}>清除缓存</Text>
-            <Text style={styles.rowHint}>删掉用不到的临时视频、图片和副本</Text>
+            <Text style={[styles.rowTitle, { color: palette.text }]}>清除缓存</Text>
+            <Text style={[styles.rowHint, { color: palette.muted }]}>删掉用不到的临时视频、图片和副本</Text>
           </View>
           {clearing ? <ActivityIndicator color={color} /> : <Text style={[styles.chevron, { color }]}>清除</Text>}
         </Pressable>
-        <View style={styles.row}>
+        <View style={[styles.row, { backgroundColor: palette.card, borderColor: palette.line }]}>
           <View style={styles.themeBlock}>
-            <Text style={styles.rowTitle}>更换主题色</Text>
-            <Text style={styles.rowHint}>按钮、开关和底部菜单会跟着变</Text>
+            <Text style={[styles.rowTitle, { color: palette.text }]}>更换主题色</Text>
+            <Text style={[styles.rowHint, { color: palette.muted }]}>按钮、开关和底部菜单会跟着变</Text>
             <View style={styles.swatches}>
               {themeColors.map((item) => {
                 const selected = item.color === color;
                 return (
                   <Pressable key={item.id} style={styles.swatchItem} onPress={() => setColor(item.color)}>
-                    <View style={[styles.swatch, { backgroundColor: item.color }, selected && styles.swatchOn]} />
-                    <Text style={[styles.swatchName, selected && { color: item.color }]}>{item.name}</Text>
+                    <View
+                      style={[
+                        styles.swatch,
+                        { backgroundColor: item.color },
+                        selected && { borderWidth: 2, borderColor: palette.text },
+                      ]}
+                    />
+                    <Text style={[styles.swatchName, { color: palette.muted }, selected && { color: item.color }]}>{item.name}</Text>
                   </Pressable>
                 );
               })}
@@ -87,7 +122,22 @@ const styles = StyleSheet.create({
     flexDirection: 'row',
     alignItems: 'center',
     gap: 12,
-    backgroundColor: 'rgba(255,255,255,0.06)',
+    borderWidth: StyleSheet.hairlineWidth,
+  },
+  modes: {
+    flexDirection: 'row',
+    gap: 8,
+  },
+  mode: {
+    flex: 1,
+    minHeight: 36,
+    borderRadius: 9,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  modeText: {
+    fontSize: 14,
+    fontWeight: '700',
   },
   rowBody: {
     flex: 1,

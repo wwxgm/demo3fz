@@ -22,11 +22,12 @@ export default function App() {
 
 function Shell() {
   const insets = useSafeAreaInsets();
+  const { palette } = useTheme();
   const [tab, setTab] = useState<Tab>('media');
 
   return (
-    <View style={styles.screen}>
-      <StatusBar style="light" />
+    <View style={[styles.screen, { backgroundColor: palette.background }]}>
+      <StatusBar style={palette.statusBar} />
       <View style={styles.body}>
         {tab === 'media' ? (
           <MediaScreen />
@@ -38,7 +39,12 @@ function Shell() {
           <SettingsScreen />
         )}
       </View>
-      <View style={[styles.tabBar, { paddingBottom: Math.max(insets.bottom, 8) }]}>
+      <View
+        style={[
+          styles.tabBar,
+          { paddingBottom: Math.max(insets.bottom, 8), backgroundColor: palette.bar, borderTopColor: palette.line },
+        ]}
+      >
         <TabButton label="视频图片" active={tab === 'media'} onPress={() => setTab('media')} />
         <TabButton label="搜索" active={tab === 'search'} onPress={() => setTab('search')} />
         <TabButton label="大字报" active={tab === 'poster'} onPress={() => setTab('poster')} />
@@ -49,10 +55,10 @@ function Shell() {
 }
 
 function TabButton({ label, active, onPress }: { label: string; active: boolean; onPress: () => void }) {
-  const { color } = useTheme();
+  const { color, palette } = useTheme();
   return (
     <Pressable style={styles.tab} onPress={onPress}>
-      <Text style={[styles.tabText, active && styles.tabTextOn, active && { color }]}>{label}</Text>
+      <Text style={[styles.tabText, { color: active ? color : palette.muted }]}>{label}</Text>
     </Pressable>
   );
 }
