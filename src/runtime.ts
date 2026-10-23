@@ -1,4 +1,4 @@
-export type ItemStatus = 'pending' | 'processing' | 'saving' | 'saved' | 'failed';
+export type ItemStatus = 'pending' | 'processing' | 'saving' | 'saved' | 'failed' | 'cancelled';
 
 export type WatermarkSettings = {
   enabled: boolean;

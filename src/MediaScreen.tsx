@@ -1,7 +1,8 @@
-import { useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import {
   ActivityIndicator,
   Alert,
+  Image,
   Linking,
   Platform,
   Pressable,
@@ -53,6 +54,8 @@ type MediaItem = {
   cover?: boolean;
   coverText?: string;
   originalSaved?: boolean;
+  preview?: string;
+  progress?: number;
 };
 
 const VIDEO_EXT = /\.(mp4|mov|m4v|avi|mkv|webm|3gp|mpeg|mpg)$/i;
@@ -127,10 +130,32 @@ export function MediaScreen() {
   const [picking, setPicking] = useState(false);
   const [savingOriginalId, setSavingOriginalId] = useState<string | null>(null);
   const [summary, setSummary] = useState('');
-  const busy = running || picking || savingOriginalId != null;
+  const [openSaved, setOpenSaved] = useState<Record<string, boolean>>({});
+  const [previewOpen, setPreviewOpen] = useState<Record<string, boolean>>({});
+  const videosRef = useRef<MediaItem[]>([]);
+  const nativeTail = useRef(Promise.resolve());
+  const stopRef = useRef(false);
+  const cancelledRef = useRef(new Set<string>());
+  const runningRef = useRef(false);
+  const busy = picking;
   const items = kind === 'video' ? videos : images;
   const setItems = kind === 'video' ? setVideos : setImages;
   const sample = images.find((item) => item.id === cropSampleId) ?? images[0];
+
+  const commitVideos = (value: MediaItem[] | ((prev: MediaItem[]) => MediaItem[])) => {
+    const next = typeof value === 'function' ? value(videosRef.current) : value;
+    videosRef.current = next;
+    commitVideos(next);
+  };
+
+  const withNative = <T,>(job: () => Promise<T>) => {
+    const run = nativeTail.current.then(job, job);
+    nativeTail.current = run.then(
+      () => undefined,
+      () => undefined,
+    );
+    return run;
+  };
 
   const addItems = (next: MediaItem[], target: Kind) => {
     if (next.length === 0) {
@@ -138,7 +163,7 @@ export function MediaScreen() {
       return;
     }
     setSummary('');
-    const update = target === 'video' ? setVideos : setImages;
+    const update = target === 'video' ? commitVideos : setImages;
     update((prev) => {
       const seen = new Set(prev.map((item) => item.uri));
       return [...prev, ...next.filter((item) => !seen.has(item.uri))];
@@ -147,6 +172,35 @@ export function MediaScreen() {
       setCropSampleId((current) => current ?? next[0]?.id ?? null);
     }
   };
+
+  const missingPreview = videos.some((item) => item.preview === undefined);
+  useEffect(() => {
+    if (!missingPreview) return undefined;
+    let cancel = false;
+    const pump = async () => {
+      while (!cancel) {
+        const next = videosRef.current.find((item) => item.preview === undefined);
+        if (!next) return;
+        try {
+          const frame = await withNative(() => VideoFlip.frameAt(next.uri, 0.3));
+          if (cancel) {
+            VideoFlip.removeTempFile(frame);
+            return;
+          }
+          commitVideos((prev) => prev.map((it) => (it.id === next.id ? { ...it, preview: frame } : it)));
+        } catch {
+          if (cancel) return;
+          commitVideos((prev) =>
+            prev.map((it) => (it.id === next.id && it.preview === undefined ? { ...it, preview: '' } : it)),
+          );
+        }
+      }
+    };
+    void pump();
+    return () => {
+      cancel = true;
+    };
+  }, [missingPreview]);
 
   const pickFromLibrary = async () => {
     if (busy) return;
@@ -230,7 +284,7 @@ export function MediaScreen() {
   };
 
   const saveOriginal = async (item: MediaItem) => {
-    if (busy || savingOriginalId || item.originalSaved) return;
+    if (savingOriginalId || item.originalSaved) return;
     setSavingOriginalId(item.id);
     const allowed = await ensurePermission();
     if (!allowed) {
@@ -239,9 +293,9 @@ export function MediaScreen() {
     }
     let staged = '';
     try {
-      staged = await VideoFlip.stageOriginal(item.uri);
+      staged = await withNative(() => VideoFlip.stageOriginal(item.uri));
       await MediaLibrary.createAssetAsync(staged);
-      setVideos((prev) => prev.map((it) => (it.id === item.id ? { ...it, originalSaved: true } : it)));
+      commitVideos((prev) => prev.map((it) => (it.id === item.id ? { ...it, originalSaved: true } : it)));
     } catch (error) {
       Alert.alert('原视频没有保存', errorText(error));
     } finally {
@@ -276,8 +330,18 @@ export function MediaScreen() {
   };
 
   const run = async () => {
-    if (busy) return;
-    const queue = items.filter((item) => item.status !== 'saved');
+    if (running || picking) return;
+    if (kind === 'video') {
+      commitVideos((prev) =>
+        prev.map((it) =>
+          it.status === 'failed' || it.status === 'cancelled'
+            ? { ...it, status: 'pending', message: undefined, progress: 0 }
+            : it,
+        ),
+      );
+    }
+    const sourceItems = kind === 'video' ? videosRef.current : items;
+    const queue = sourceItems.filter((item) => item.status !== 'saved');
     if (items.length === 0) {
       Alert.alert(kind === 'video' ? '还没有视频' : '还没有图片', '请先从相册或文件里选择。');
       return;
@@ -345,134 +409,233 @@ export function MediaScreen() {
         ));
 
     setRunning(true);
+    runningRef.current = true;
     setSummary('');
     let saved = 0;
     let failed = 0;
+    let cancelled = 0;
     const saveNext = createSaveQueue();
     const mark = watermarkPayload(watermark);
+    const stopped = (error: unknown) => {
+      const text = errorText(error);
+      return stopRef.current || text.includes('已取消') || text.includes('已停止');
+    };
 
-    await runWithLimit(queue, kind === 'video' || heavy ? 1 : 2, async (item) => {
-      setItems((prev) =>
-        prev.map((it) => (it.id === item.id ? { ...it, status: 'processing', message: '正在处理…' } : it)),
-      );
-      let outputUri = '';
-      try {
-        outputUri =
-          kind === 'video'
-            ? await VideoFlip.flipHorizontal(item.uri, {
-                watermark: watermarkPayload(item.watermark ?? defaultWatermark),
-                zoom,
-                subtitle: item.subtitle?.trim() || undefined,
-                extend:
-                  extendVideo && useCurrentClip
-                    ? {
-                        start: Number(clipStart),
-                        end: Number(clipEnd),
-                        freeze: Number(freezeSeconds),
-                        mode: highlightMode,
-                      }
-                    : undefined,
-                filter: item.filter,
-                ...(item.cut
-                  ? { cut: { start: Number(item.cut.start), end: Number(item.cut.end) } }
-                  : {}),
-              })
-            : await VideoFlip.processImage(item.uri, {
-                flip: flipImages,
-                crop: crop ?? undefined,
-                watermark: mark,
-              });
-        if (kind === 'video' && followOn && followClip) {
-          const joined = await VideoFlip.joinVideos([outputUri, followClip.uri]);
-          VideoFlip.removeTempFile(outputUri);
-          outputUri = joined;
-        }
-        setItems((prev) =>
-          prev.map((it) => (it.id === item.id ? { ...it, status: 'saving', message: '等待写入相册…' } : it)),
+    if (kind === 'video') {
+      stopRef.current = false;
+      cancelledRef.current = new Set();
+      VideoFlip.prepareFlipBatch();
+      while (!stopRef.current) {
+        const item = videosRef.current.find((it) => it.status === 'pending' && !cancelledRef.current.has(it.id));
+        if (!item) break;
+        commitVideos((prev) =>
+          prev.map((it) =>
+            it.id === item.id ? { ...it, status: 'processing', message: '正在转换…', progress: 0.01 } : it,
+          ),
         );
-        await saveNext(async () => {
+        const timer = setInterval(() => {
+          const value = VideoFlip.flipProgress(item.id);
+          commitVideos((prev) =>
+            prev.map((it) => (it.id === item.id && it.status === 'processing' ? { ...it, progress: value } : it)),
+          );
+        }, 500);
+        let outputUri = '';
+        try {
+          outputUri = await withNative(() =>
+            VideoFlip.flipHorizontal(item.uri, {
+              jobId: item.id,
+              watermark: watermarkPayload(item.watermark ?? defaultWatermark),
+              zoom,
+              subtitle: item.subtitle?.trim() || undefined,
+              extend:
+                extendVideo && useCurrentClip
+                  ? {
+                      start: Number(clipStart),
+                      end: Number(clipEnd),
+                      freeze: Number(freezeSeconds),
+                      mode: highlightMode,
+                    }
+                  : undefined,
+              filter: item.filter,
+              ...(item.cut ? { cut: { start: Number(item.cut.start), end: Number(item.cut.end) } } : {}),
+            }),
+          );
+          if (stopRef.current || cancelledRef.current.has(item.id)) {
+            throw new Error('翻转已取消');
+          }
+          if (followOn && followClip) {
+            const joined = await withNative(() => VideoFlip.joinVideos([outputUri, followClip.uri]));
+            VideoFlip.removeTempFile(outputUri);
+            outputUri = joined;
+          }
+          clearInterval(timer);
+          commitVideos((prev) =>
+            prev.map((it) =>
+              it.id === item.id ? { ...it, status: 'saving', message: '正在保存到相册…', progress: 0.98 } : it,
+            ),
+          );
+          await saveNext(async () => {
+            await MediaLibrary.createAssetAsync(outputUri);
+          });
+          if (stopRef.current || cancelledRef.current.has(item.id)) {
+            throw new Error('翻转已取消');
+          }
+          const notes: string[] = [];
+          const missed: string[] = [];
+          if (item.sampleFrames && outputUri) {
+            let frames: string[] = [];
+            try {
+              commitVideos((prev) =>
+                prev.map((it) => (it.id === item.id ? { ...it, message: '正在抽这一条的画面…' } : it)),
+              );
+              frames = await withNative(() => VideoFlip.sampleFrames(outputUri, 4));
+              await saveNext(async () => {
+                for (const frame of frames) {
+                  await MediaLibrary.createAssetAsync(frame);
+                }
+              });
+              notes.push(`另存 ${frames.length} 张抽帧图片`);
+            } catch {
+              missed.push('抽帧');
+            } finally {
+              frames.forEach((frame) => VideoFlip.removeTempFile(frame));
+            }
+          }
+          if (item.cover && outputUri && !cancelledRef.current.has(item.id) && !stopRef.current) {
+            let coverUri = '';
+            try {
+              commitVideos((prev) =>
+                prev.map((it) => (it.id === item.id ? { ...it, message: '正在做这一条的封面…' } : it)),
+              );
+              coverUri = await withNative(() => VideoFlip.makeCover(outputUri, item.coverText?.trim() ?? ''));
+              await saveNext(async () => {
+                await MediaLibrary.createAssetAsync(coverUri);
+              });
+              notes.push('另存 1 张封面');
+            } catch {
+              missed.push('封面');
+            } finally {
+              if (coverUri) VideoFlip.removeTempFile(coverUri);
+            }
+          }
+          saved += 1;
+          const savedNote = notes.length > 0 ? `，${notes.join('，')}` : '';
+          const missedNote = missed.length > 0 ? `。视频已保存，这一条${missed.join('和')}没有成功` : '';
+          commitVideos((prev) =>
+            prev.map((it) =>
+              it.id === item.id
+                ? { ...it, status: 'saved', progress: 1, message: `已保存到相册${savedNote}${missedNote}` }
+                : it,
+            ),
+          );
+        } catch (error) {
+          if (stopped(error) || cancelledRef.current.has(item.id)) {
+            const text = errorText(error);
+            if (text.includes('长时间没有进展')) {
+              failed += 1;
+              commitVideos((prev) =>
+                prev.map((it) => (it.id === item.id ? { ...it, status: 'failed', progress: 0, message: text } : it)),
+              );
+            } else {
+              cancelled += 1;
+              commitVideos((prev) =>
+                prev.map((it) =>
+                  it.id === item.id ? { ...it, status: 'cancelled', progress: 0, message: '已取消，可以保存原视频或重新转换' } : it,
+                ),
+              );
+            }
+          } else {
+            failed += 1;
+            commitVideos((prev) =>
+              prev.map((it) => (it.id === item.id ? { ...it, status: 'failed', progress: 0, message: errorText(error) } : it)),
+            );
+          }
+        } finally {
+          clearInterval(timer);
+          if (outputUri) VideoFlip.removeTempFile(outputUri);
+        }
+      }
+    } else {
+      await runWithLimit(queue, heavy ? 1 : 2, async (item) => {
+        setItems((prev) =>
+          prev.map((it) => (it.id === item.id ? { ...it, status: 'processing', message: '正在处理…' } : it)),
+        );
+        let outputUri = '';
+        try {
+          outputUri = await VideoFlip.processImage(item.uri, {
+            flip: flipImages,
+            crop: crop ?? undefined,
+            watermark: mark,
+          });
           setItems((prev) =>
             prev.map((it) => (it.id === item.id ? { ...it, status: 'saving', message: '正在保存到相册…' } : it)),
           );
-          await MediaLibrary.createAssetAsync(outputUri);
-        });
-        let notes: string[] = [];
-        const missed: string[] = [];
-        if (kind === 'video' && item.sampleFrames && outputUri) {
-          let frames: string[] = [];
-          try {
-            setItems((prev) =>
-              prev.map((it) => (it.id === item.id ? { ...it, status: 'saving', message: '正在抽这一条的画面…' } : it)),
-            );
-            frames = await VideoFlip.sampleFrames(outputUri, 4);
-            await saveNext(async () => {
-              for (const frame of frames) {
-                await MediaLibrary.createAssetAsync(frame);
-              }
-            });
-            notes.push(`另存 ${frames.length} 张抽帧图片`);
-          } catch {
-            missed.push('抽帧');
-          } finally {
-            frames.forEach((frame) => VideoFlip.removeTempFile(frame));
-          }
+          await saveNext(async () => {
+            await MediaLibrary.createAssetAsync(outputUri);
+          });
+          saved += 1;
+          setItems((prev) =>
+            prev.map((it) => (it.id === item.id ? { ...it, status: 'saved', message: '已保存到相册' } : it)),
+          );
+        } catch (error) {
+          failed += 1;
+          setItems((prev) =>
+            prev.map((it) => (it.id === item.id ? { ...it, status: 'failed', message: errorText(error) } : it)),
+          );
+        } finally {
+          if (outputUri) VideoFlip.removeTempFile(outputUri);
         }
-        if (kind === 'video' && item.cover && outputUri) {
-          let coverUri = '';
-          try {
-            setItems((prev) =>
-              prev.map((it) => (it.id === item.id ? { ...it, status: 'saving', message: '正在做这一条的封面…' } : it)),
-            );
-            coverUri = await VideoFlip.makeCover(outputUri, item.coverText?.trim() ?? '');
-            await saveNext(async () => {
-              await MediaLibrary.createAssetAsync(coverUri);
-            });
-            notes.push('另存 1 张封面');
-          } catch {
-            missed.push('封面');
-          } finally {
-            if (coverUri) VideoFlip.removeTempFile(coverUri);
-          }
-        }
-        saved += 1;
-        const savedNote = notes.length > 0 ? `，${notes.join('，')}` : '';
-        const missedNote = missed.length > 0 ? `。视频已保存，这一条${missed.join('和')}没有成功` : '';
-        setItems((prev) =>
-          prev.map((it) =>
-            it.id === item.id
-              ? {
-                  ...it,
-                  status: 'saved',
-                  message: `已保存到相册${savedNote}${missedNote}`,
-                }
-              : it,
-          ),
-        );
-      } catch (error) {
-        failed += 1;
-        setItems((prev) =>
-          prev.map((it) => (it.id === item.id ? { ...it, status: 'failed', message: errorText(error) } : it)),
-        );
-      } finally {
-        if (outputUri) VideoFlip.removeTempFile(outputUri);
-      }
-    });
+      });
+    }
 
     const text =
-      failed === 0
-        ? `已把 ${saved} 个保存到相册`
-        : `成功 ${saved} 个，失败 ${failed} 个。失败的可以再点一次重试`;
+      cancelled > 0
+        ? `保存 ${saved} 个，失败 ${failed} 个，取消 ${cancelled} 个。没完成的可以再转，也可以先把原视频存进相册。`
+        : failed === 0
+          ? `已把 ${saved} 个保存到相册`
+          : `成功 ${saved} 个，失败 ${failed} 个。失败的可以再点一次重试`;
     setSummary(text);
+    runningRef.current = false;
     setRunning(false);
-    Alert.alert(failed === 0 ? '已保存' : '处理结束', text);
+    if (!stopRef.current) {
+      Alert.alert(failed === 0 && cancelled === 0 ? '已保存' : '处理结束', text);
+    }
+  };
+
+  const cancelItem = (id: string) => {
+    cancelledRef.current.add(id);
+    VideoFlip.cancelFlip(id);
+    const current = videosRef.current.find((item) => item.id === id);
+    if (!current) return;
+    if (current.status === 'processing') {
+      commitVideos((prev) => prev.map((it) => (it.id === id ? { ...it, message: '正在取消…' } : it)));
+      return;
+    }
+    if (current.status === 'pending' || current.status === 'failed' || current.status === 'cancelled') {
+      commitVideos((prev) =>
+        prev.map((it) => (it.id === id ? { ...it, status: 'cancelled', progress: 0, message: '已取消，可以保存原视频或重新转换' } : it)),
+      );
+    }
+  };
+
+  const stopAll = () => {
+    stopRef.current = true;
+    VideoFlip.cancelAllFlips();
+    commitVideos((prev) =>
+      prev.map((it) => {
+        if (it.status !== 'pending') return it;
+        cancelledRef.current.add(it.id);
+        return { ...it, status: 'cancelled', progress: 0, message: '已取消，可以保存原视频或重新转换' };
+      }),
+    );
   };
 
   const pendingCount = items.filter((item) => item.status !== 'saved').length;
 
   const refreshVideo = () => {
-    if (busy) return;
+    if (running || picking) return;
     setKind('video');
-    setVideos([]);
+    commitVideos([]);
     setWatermark(defaultWatermark);
     setZoom(1);
     setUseCurrentClip(true);
@@ -540,16 +703,16 @@ export function MediaScreen() {
         <Text style={styles.title}>{kind === 'video' ? '视频处理' : '图片处理'}</Text>
         {kind === 'video' ? (
           <View style={styles.titleActions}>
-            <Pressable disabled={busy} onPress={refreshVideo} hitSlop={8}>
+            <Pressable disabled={running || picking} onPress={refreshVideo} hitSlop={8}>
               <Text style={styles.link}>刷新</Text>
             </Pressable>
-            <Pressable disabled={busy} onPress={() => setSmearOpen(true)} hitSlop={8}>
+            <Pressable disabled={running || picking} onPress={() => setSmearOpen(true)} hitSlop={8}>
               <Text style={styles.link}>去水印</Text>
             </Pressable>
-            <Pressable disabled={busy} onPress={() => setFaceOpen(true)} hitSlop={8}>
+            <Pressable disabled={running || picking} onPress={() => setFaceOpen(true)} hitSlop={8}>
               <Text style={styles.link}>遮脸</Text>
             </Pressable>
-            <Pressable disabled={busy} onPress={() => setMergeOpen(true)} hitSlop={8}>
+            <Pressable disabled={running || picking} onPress={() => setMergeOpen(true)} hitSlop={8}>
               <Text style={styles.link}>合并</Text>
             </Pressable>
           </View>
@@ -707,11 +870,18 @@ export function MediaScreen() {
         </View>
         <View style={styles.listHead}>
           <Text style={styles.listTitle}>已选 {items.length} 个</Text>
-          {items.length > 0 && !busy ? (
+          {items.length > 0 && !running && !picking ? (
             <Pressable
               onPress={() => {
-                setItems([]);
-                if (kind === 'image') setCropSampleId(null);
+                if (kind === 'video') {
+                  videosRef.current.forEach((item) => {
+                    if (item.preview) VideoFlip.removeTempFile(item.preview);
+                  });
+                  commitVideos([]);
+                } else {
+                  setItems([]);
+                  setCropSampleId(null);
+                }
               }}
             >
               <Text style={styles.link}>清空</Text>
@@ -724,6 +894,26 @@ export function MediaScreen() {
           items.map((item, index) => {
             const meta = [item.source, formatDuration(item.durationMs), formatSize(item.size)].filter(Boolean).join(' · ');
             const isSample = kind === 'image' && sample?.id === item.id;
+            const savedFolded = kind === 'video' && item.status === 'saved' && openSaved[item.id] !== true;
+            if (savedFolded) {
+              return (
+                <View key={item.id} style={styles.card}>
+                  <View style={styles.compactRow}>
+                    <Text style={styles.cardName} numberOfLines={1}>
+                      {index + 1}. {item.name} · 已保存
+                    </Text>
+                    <Pressable onPress={() => setOpenSaved((prev) => ({ ...prev, [item.id]: true }))} hitSlop={8}>
+                      <Text style={styles.link}>展开</Text>
+                    </Pressable>
+                  </View>
+                </View>
+              );
+            }
+            const showPreview =
+              kind === 'video' &&
+              Boolean(item.preview) &&
+              (previewOpen[item.id] ?? (item.status === 'processing' || item.status === 'saving'));
+            const active = item.status === 'processing' || item.status === 'saving';
             return (
               <View key={item.id} style={styles.card}>
                 <View style={styles.cardBody}>
@@ -733,11 +923,43 @@ export function MediaScreen() {
                   </Text>
                   {meta ? <Text style={styles.cardMeta}>{meta}</Text> : null}
                   {kind === 'video' ? (
+                    <View style={styles.compactRow}>
+                      {item.preview ? (
+                        <Pressable
+                          onPress={() => setPreviewOpen((prev) => ({ ...prev, [item.id]: !showPreview }))}
+                          hitSlop={8}
+                        >
+                          <Text style={styles.link}>{showPreview ? '收起预览' : '预览'}</Text>
+                        </Pressable>
+                      ) : (
+                        <Text style={styles.cardMeta}>{item.preview === undefined ? '正在读取预览…' : '没有预览'}</Text>
+                      )}
+                      {item.status === 'pending' || item.status === 'processing' ? (
+                        <Pressable onPress={() => cancelItem(item.id)} hitSlop={8}>
+                          <Text style={styles.link}>取消这条</Text>
+                        </Pressable>
+                      ) : null}
+                      {item.status === 'saved' ? (
+                        <Pressable onPress={() => setOpenSaved((prev) => ({ ...prev, [item.id]: false }))} hitSlop={8}>
+                          <Text style={styles.link}>收起</Text>
+                        </Pressable>
+                      ) : null}
+                    </View>
+                  ) : null}
+                  {showPreview && item.preview ? (
+                    <Image source={{ uri: item.preview }} style={styles.preview} resizeMode="cover" />
+                  ) : null}
+                  {active ? (
+                    <View style={styles.track}>
+                      <View style={[styles.bar, { width: `${Math.max(4, Math.round((item.progress ?? 0) * 100))}%` }]} />
+                    </View>
+                  ) : null}
+                  {kind === 'video' ? (
                     <>
                       <TextInput
                         value={item.subtitle ?? ''}
                         onChangeText={(text) =>
-                          setVideos((prev) => prev.map((it) => (it.id === item.id ? { ...it, subtitle: text } : it)))
+                          commitVideos((prev) => prev.map((it) => (it.id === item.id ? { ...it, subtitle: text } : it)))
                         }
                         editable={!busy}
                         placeholder="给这条视频加字幕，留空则不加"
@@ -755,7 +977,7 @@ export function MediaScreen() {
                               disabled={busy}
                               style={[styles.zoomChip, selected && styles.zoomChipOn, selected && { backgroundColor: accent }]}
                               onPress={() =>
-                                setVideos((prev) =>
+                                commitVideos((prev) =>
                                   prev.map((it) =>
                                     it.id === item.id ? { ...it, filter: name === '' ? undefined : name } : it,
                                   ),
@@ -772,7 +994,7 @@ export function MediaScreen() {
                         disabled={busy}
                         value={item.watermark ?? defaultWatermark}
                         onChange={(next) =>
-                          setVideos((prev) => prev.map((it) => (it.id === item.id ? { ...it, watermark: next } : it)))
+                          commitVideos((prev) => prev.map((it) => (it.id === item.id ? { ...it, watermark: next } : it)))
                         }
                       />
                       <View style={styles.optionRow}>
@@ -781,7 +1003,7 @@ export function MediaScreen() {
                           disabled={busy}
                           value={item.cut != null}
                           onValueChange={(enabled) =>
-                            setVideos((prev) =>
+                            commitVideos((prev) =>
                               prev.map((it) =>
                                 it.id === item.id ? { ...it, cut: enabled ? { start: '', end: '' } : undefined } : it,
                               ),
@@ -797,7 +1019,7 @@ export function MediaScreen() {
                             <TextInput
                               value={item.cut.start}
                               onChangeText={(text) =>
-                                setVideos((prev) =>
+                                commitVideos((prev) =>
                                   prev.map((it) =>
                                     it.id === item.id && it.cut ? { ...it, cut: { ...it.cut, start: text } } : it,
                                   ),
@@ -813,7 +1035,7 @@ export function MediaScreen() {
                             <TextInput
                               value={item.cut.end}
                               onChangeText={(text) =>
-                                setVideos((prev) =>
+                                commitVideos((prev) =>
                                   prev.map((it) =>
                                     it.id === item.id && it.cut ? { ...it, cut: { ...it.cut, end: text } } : it,
                                   ),
@@ -838,7 +1060,7 @@ export function MediaScreen() {
                           disabled={busy}
                           value={item.sampleFrames === true}
                           onValueChange={(enabled) =>
-                            setVideos((prev) =>
+                            commitVideos((prev) =>
                               prev.map((it) => (it.id === item.id ? { ...it, sampleFrames: enabled } : it)),
                             )
                           }
@@ -856,7 +1078,7 @@ export function MediaScreen() {
                           disabled={busy}
                           value={item.cover === true}
                           onValueChange={(enabled) =>
-                            setVideos((prev) =>
+                            commitVideos((prev) =>
                               prev.map((it) => (it.id === item.id ? { ...it, cover: enabled } : it)),
                             )
                           }
@@ -868,7 +1090,7 @@ export function MediaScreen() {
                           <TextInput
                             value={item.coverText ?? ''}
                             onChangeText={(text) =>
-                              setVideos((prev) => prev.map((it) => (it.id === item.id ? { ...it, coverText: text } : it)))
+                              commitVideos((prev) => prev.map((it) => (it.id === item.id ? { ...it, coverText: text } : it)))
                             }
                             editable={!busy}
                             placeholder="封面文字，可不填"
@@ -894,11 +1116,11 @@ export function MediaScreen() {
                       {item.message}
                     </Text>
                   ) : null}
-                  {kind === 'video' && (item.status === 'failed' || (item.source === '文件' && item.status !== 'saved')) ? (
+                  {kind === 'video' && item.status !== 'saved' && (item.source === '文件' || item.status === 'failed' || item.status === 'cancelled') ? (
                     <Pressable
-                      disabled={busy || savingOriginalId != null || item.originalSaved}
+                      disabled={savingOriginalId != null || item.originalSaved}
                       onPress={() => void saveOriginal(item)}
-                      style={[styles.keepOriginal, (busy || savingOriginalId != null || item.originalSaved) && styles.primaryDisabled]}
+                      style={[styles.keepOriginal, (savingOriginalId != null || item.originalSaved) && styles.primaryDisabled]}
                     >
                       <Text style={styles.keepOriginalText}>
                         {item.originalSaved
@@ -920,11 +1142,16 @@ export function MediaScreen() {
                     </Pressable>
                   ) : null}
                 </View>
-                {!busy ? (
+                {item.status !== 'processing' && item.status !== 'saving' ? (
                   <Pressable
                     onPress={() => {
-                      setItems((prev) => prev.filter((it) => it.id !== item.id));
-                      if (cropSampleId === item.id) setCropSampleId(null);
+                      if (item.preview) VideoFlip.removeTempFile(item.preview);
+                      if (kind === 'video') {
+                        commitVideos((prev) => prev.filter((it) => it.id !== item.id));
+                      } else {
+                        setItems((prev) => prev.filter((it) => it.id !== item.id));
+                        if (cropSampleId === item.id) setCropSampleId(null);
+                      }
                     }}
                     hitSlop={10}
                   >
@@ -938,21 +1165,31 @@ export function MediaScreen() {
       </ScrollView>
       {summary ? <Text style={styles.summary}>{summary}</Text> : null}
       <View style={styles.footer}>
-        <Pressable
-          style={[styles.primary, { backgroundColor: accent }, (busy || pendingCount === 0) && styles.primaryDisabled]}
-          disabled={busy || pendingCount === 0}
-          onPress={() => void run()}
-        >
-          {busy ? (
-            <ActivityIndicator color="#F4F7FB" />
-          ) : (
-            <Text style={styles.primaryText}>
-              {kind === 'video' ? `一键水平翻转并保存（${pendingCount}）` : `处理并保存（${pendingCount}）`}
-            </Text>
-          )}
-        </Pressable>
+        {running && kind === 'video' ? (
+          <Pressable style={[styles.primary, { backgroundColor: accent }]} onPress={stopAll}>
+            <Text style={styles.primaryText}>全部停止</Text>
+          </Pressable>
+        ) : (
+          <Pressable
+            style={[styles.primary, { backgroundColor: accent }, (picking || pendingCount === 0) && styles.primaryDisabled]}
+            disabled={picking || pendingCount === 0}
+            onPress={() => void run()}
+          >
+            {picking ? (
+              <ActivityIndicator color="#F4F7FB" />
+            ) : (
+              <Text style={styles.primaryText}>
+                {kind === 'video' ? `一键水平翻转并保存（${pendingCount}）` : `处理并保存（${pendingCount}）`}
+              </Text>
+            )}
+          </Pressable>
+        )}
         <Text style={styles.footerHint}>
-          {picking ? '正在读取…' : '视频一条一条处理。没勾选抽帧和封面的只保存视频。请留在这个页面。'}
+          {picking
+            ? '正在读取…'
+            : running
+              ? '一次转一条，其余排队。可以取消单条、全部停止，也可以继续添加视频。'
+              : '视频一条一条转换。成功的会收起。没勾选抽帧和封面的只保存视频。'}
         </Text>
       </View>
       {cropOpen && sample ? (
@@ -1163,6 +1400,28 @@ function createMediaStyles(palette: Palette, accent: string) {
   cardMeta: {
     color: palette.muted,
     fontSize: 13,
+  },
+  compactRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 12,
+  },
+  preview: {
+    width: '100%',
+    height: 140,
+    borderRadius: 10,
+    backgroundColor: palette.field,
+  },
+  track: {
+    height: 6,
+    borderRadius: 3,
+    overflow: 'hidden',
+    backgroundColor: palette.field,
+  },
+  bar: {
+    height: '100%',
+    borderRadius: 3,
+    backgroundColor: accent,
   },
   cardStatus: {
     color: accent,

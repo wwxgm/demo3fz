@@ -41,6 +41,7 @@ export type VideoProcessOptions = {
     start: number;
     end: number;
   };
+  jobId?: string;
 };
 
 type VideoFlipNative = {
@@ -77,6 +78,10 @@ type VideoFlipNative = {
   }): Promise<string>;
   loadPage(url: string, referer: string): Promise<string>;
   stageOriginal(uri: string): Promise<string>;
+  prepareFlipBatch(): void;
+  flipProgress(id: string): number;
+  cancelFlip(id: string): void;
+  cancelAllFlips(): void;
   removeTempFile(uri: string): void;
   clearProcessingCache(): number;
 };
@@ -117,6 +122,12 @@ const missing: VideoFlipNative = {
   async stageOriginal() {
     throw new Error(missingMessage);
   },
+  prepareFlipBatch() {},
+  flipProgress() {
+    return 0;
+  },
+  cancelFlip() {},
+  cancelAllFlips() {},
   removeTempFile() {},
   clearProcessingCache() {
     return 0;

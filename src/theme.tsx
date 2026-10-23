@@ -38,15 +38,15 @@ export const darkPalette: Palette = {
 };
 
 export const lightPalette: Palette = {
-  background: '#F4F7FB',
+  background: '#FFFFFF',
   bar: '#FFFFFF',
   card: '#FFFFFF',
-  field: '#E7EEF6',
-  text: '#172033',
-  muted: '#5C6B7C',
-  placeholder: '#8B98A8',
-  line: 'rgba(23,32,51,0.12)',
-  switchOff: '#D5DEE8',
+  field: '#F4F5F7',
+  text: '#1A1A1A',
+  muted: '#6B7280',
+  placeholder: '#9CA3AF',
+  line: 'rgba(0,0,0,0.08)',
+  switchOff: '#E5E7EB',
   statusBar: 'dark',
 };
 
@@ -61,14 +61,14 @@ type ThemeValue = {
 const ThemeContext = createContext<ThemeValue>({
   color: themeColors[0].color,
   setColor: () => undefined,
-  appearance: 'dark',
+  appearance: 'light',
   setAppearance: () => undefined,
-  palette: darkPalette,
+  palette: lightPalette,
 });
 
 export function ThemeProvider({ children }: { children: ReactNode }) {
   const [color, setColor] = useState(themeColors[0].color);
-  const [appearance, setAppearance] = useState<Appearance>('dark');
+  const [appearance, setAppearance] = useState<Appearance>('light');
   const palette = appearance === 'light' ? lightPalette : darkPalette;
   const value = useMemo(
     () => ({ color, setColor, appearance, setAppearance, palette }),

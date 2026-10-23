@@ -66,7 +66,7 @@ function TabButton({ label, active, onPress }: { label: string; active: boolean;
 const styles = StyleSheet.create({
   screen: {
     flex: 1,
-    backgroundColor: '#0B1F33',
+    backgroundColor: '#FFFFFF',
   },
   body: {
     flex: 1,
@@ -74,8 +74,8 @@ const styles = StyleSheet.create({
   tabBar: {
     flexDirection: 'row',
     borderTopWidth: StyleSheet.hairlineWidth,
-    borderTopColor: 'rgba(255,255,255,0.14)',
-    backgroundColor: '#071521',
+    borderTopColor: 'rgba(0,0,0,0.08)',
+    backgroundColor: '#FFFFFF',
   },
   tab: {
     flex: 1,
@@ -84,7 +84,7 @@ const styles = StyleSheet.create({
     justifyContent: 'center',
   },
   tabText: {
-    color: '#9BB0C5',
+    color: '#6B7280',
     fontSize: 13,
     fontWeight: '600',
   },
