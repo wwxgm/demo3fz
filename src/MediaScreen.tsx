@@ -145,7 +145,7 @@ export function MediaScreen() {
   const commitVideos = (value: MediaItem[] | ((prev: MediaItem[]) => MediaItem[])) => {
     const next = typeof value === 'function' ? value(videosRef.current) : value;
     videosRef.current = next;
-    commitVideos(next);
+    setVideos(next);
   };
 
   const withNative = <T,>(job: () => Promise<T>) => {
