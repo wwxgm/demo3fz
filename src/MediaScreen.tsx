@@ -51,6 +51,10 @@ type MediaItem = {
   watermark?: WatermarkSettings;
   cut?: { start: string; end: string };
   sampleFrames?: boolean;
+  /** 默认翻转。false 表示这一条不翻转，直接保存原视频。 */
+  flip?: boolean;
+  /** 翻转失败后自动改存的原视频，用来和正常翻转换成片区分。 */
+  flipFallback?: boolean;
   cover?: boolean;
   coverText?: string;
   originalSaved?: boolean;
@@ -99,6 +103,12 @@ function canKeepOriginal(item: MediaItem) {
   return !item.uri.startsWith('ph://') && !item.uri.startsWith('assets-library://');
 }
 
+function isOriginalPreview(item: MediaItem) {
+  if (item.flipFallback) return true;
+  if (item.flip === false && item.status === 'saved') return true;
+  return item.originalSaved === true && item.status !== 'saved';
+}
+
 function formatDuration(durationMs?: number) {
   if (!durationMs || durationMs <= 0) return '';
   const total = Math.round(durationMs / 1000);
@@ -137,6 +147,7 @@ export function MediaScreen() {
   const [summary, setSummary] = useState('');
   const [openSaved, setOpenSaved] = useState<Record<string, boolean>>({});
   const [previewOpen, setPreviewOpen] = useState<Record<string, boolean>>({});
+  const [previewList, setPreviewList] = useState<'default' | 'all' | 'original' | 'current'>('default');
   const [batchWatermark, setBatchWatermark] = useState(false);
   const videosRef = useRef<MediaItem[]>([]);
   const nativeTail = useRef(Promise.resolve());
@@ -367,7 +378,7 @@ export function MediaScreen() {
       commitVideos((prev) =>
         prev.map((it) =>
           it.status === 'failed' || it.status === 'cancelled'
-            ? { ...it, status: 'pending', message: undefined, progress: 0 }
+            ? { ...it, status: 'pending', message: undefined, progress: 0, flipFallback: undefined }
             : it,
         ),
       );
@@ -407,7 +418,7 @@ export function MediaScreen() {
     }
     if (kind === 'video') {
       const invalidCut = queue.find((item) => {
-        if (!item.cut) return false;
+        if (item.flip === false || !item.cut) return false;
         const start = Number(item.cut.start);
         const end = Number(item.cut.end);
         if (!Number.isFinite(start) || !Number.isFinite(end) || start < 0 || end <= start + 0.04) return true;
@@ -491,6 +502,9 @@ export function MediaScreen() {
           );
         }, 500);
         let outputUri = '';
+        let holdOriginal = false;
+        let fallbackReason = '';
+        let keepStraight = false;
         const withExport = async <T,>(job: () => Promise<T>) => {
           const deadline = Date.now() + 8000;
           while (
@@ -533,6 +547,40 @@ export function MediaScreen() {
               previewBusy.current = false;
             }
           }
+          const keepStraightNow = (videosRef.current.find((it) => it.id === item.id) ?? item).flip === false;
+          keepStraight = keepStraightNow;
+          if (keepStraightNow) {
+            clearInterval(timer);
+            if (stopRef.current || cancelledRef.current.has(item.id)) {
+              throw new Error('翻转已取消');
+            }
+            commitVideos((prev) =>
+              prev.map((it) =>
+                it.id === item.id ? { ...it, status: 'processing', message: '不翻转，正在保存原视频…', progress: 0.4 } : it,
+              ),
+            );
+            outputUri = await withNative(() => VideoFlip.stageOriginal(item.uri));
+            if (stopRef.current || cancelledRef.current.has(item.id)) {
+              throw new Error('翻转已取消');
+            }
+            commitVideos((prev) =>
+              prev.map((it) =>
+                it.id === item.id ? { ...it, status: 'saving', message: '正在保存到相册…', progress: 0.9 } : it,
+              ),
+            );
+            await saveNext(async () => {
+              await MediaLibrary.createAssetAsync(outputUri);
+            });
+            if (stopRef.current || cancelledRef.current.has(item.id)) {
+              throw new Error('翻转已取消');
+            }
+            saved += 1;
+            commitVideos((prev) =>
+              prev.map((it) =>
+                it.id === item.id ? { ...it, status: 'saved', progress: 1, flipFallback: undefined, message: '已把原视频保存到相册' } : it,
+              ),
+            );
+          } else {
           outputUri = await withExport(() =>
             withNative(() =>
               abandonIfStopped(item.id, () =>
@@ -620,17 +668,23 @@ export function MediaScreen() {
           commitVideos((prev) =>
             prev.map((it) =>
               it.id === item.id
-                ? { ...it, status: 'saved', progress: 1, message: `已保存到相册${savedNote}${missedNote}` }
+                ? { ...it, status: 'saved', progress: 1, flipFallback: undefined, message: `已保存到相册${savedNote}${missedNote}` }
                 : it,
             ),
           );
+          }
         } catch (error) {
           if (stopped(error) || cancelledRef.current.has(item.id)) {
             const text = errorText(error);
             if (text.includes('长时间没有进展')) {
-              failed += 1;
+              holdOriginal = !stopRef.current;
+              fallbackReason = text;
               commitVideos((prev) =>
-                prev.map((it) => (it.id === item.id ? { ...it, status: 'failed', progress: 0, message: text } : it)),
+                prev.map((it) =>
+                  it.id === item.id
+                    ? { ...it, status: 'saving', progress: 0.9, message: '翻转没有成功，正在自动保存原视频…' }
+                    : it,
+                ),
               );
             } else {
               cancelled += 1;
@@ -642,15 +696,87 @@ export function MediaScreen() {
                 ),
               );
             }
-          } else {
+          } else if (keepStraight) {
             failed += 1;
             commitVideos((prev) =>
-              prev.map((it) => (it.id === item.id ? { ...it, status: 'failed', progress: 0, message: errorText(error) } : it)),
+              prev.map((it) =>
+                it.id === item.id
+                  ? { ...it, status: 'failed', progress: 0, message: `原视频没有保存。${errorText(error)}` }
+                  : it,
+              ),
+            );
+          } else {
+            holdOriginal = !stopRef.current;
+            fallbackReason = errorText(error);
+            commitVideos((prev) =>
+              prev.map((it) =>
+                it.id === item.id
+                  ? { ...it, status: 'saving', progress: 0.9, message: '翻转没有成功，正在自动保存原视频…' }
+                  : it,
+              ),
             );
           }
         } finally {
           clearInterval(timer);
           if (outputUri) VideoFlip.removeTempFile(outputUri);
+        }
+        if (!stopRef.current && holdOriginal && !cancelledRef.current.has(item.id)) {
+          const reason = fallbackReason || '翻转没有成功';
+          let staged = '';
+          try {
+            staged = await VideoFlip.stageOriginal(item.uri);
+            if (stopRef.current || cancelledRef.current.has(item.id)) {
+              throw new Error('翻转已取消');
+            }
+            await saveNext(async () => {
+              await MediaLibrary.createAssetAsync(staged);
+            });
+            saved += 1;
+            setPreviewOpen((prev) => ({ ...prev, [item.id]: true }));
+            commitVideos((prev) =>
+              prev.map((it) =>
+                it.id === item.id
+                  ? {
+                      ...it,
+                      status: 'saved',
+                      progress: 1,
+                      originalSaved: true,
+                      flipFallback: true,
+                      message: `翻转失败，已自动保存原视频。原因：${reason}`,
+                    }
+                  : it,
+              ),
+            );
+          } catch (error) {
+            if (stopRef.current || cancelledRef.current.has(item.id) || errorText(error).includes('已取消')) {
+              cancelled += 1;
+              commitVideos((prev) =>
+                prev.map((it) =>
+                  it.id === item.id
+                    ? { ...it, status: 'cancelled', progress: 0, message: '已取消。可以保存原视频，后面的会继续转换。' }
+                    : it,
+                ),
+              );
+            } else {
+              failed += 1;
+              setPreviewOpen((prev) => ({ ...prev, [item.id]: true }));
+              commitVideos((prev) =>
+                prev.map((it) =>
+                  it.id === item.id
+                    ? {
+                        ...it,
+                        status: 'failed',
+                        progress: 0,
+                        flipFallback: true,
+                        message: `翻转失败，原视频也没有保存成功。原因：${reason}。${errorText(error)}`,
+                      }
+                    : it,
+                ),
+              );
+            }
+          } finally {
+            if (staged) VideoFlip.removeTempFile(staged);
+          }
         }
         if (!stopRef.current && cancelledRef.current.has(item.id)) {
           const started = Date.now();
@@ -777,6 +903,7 @@ export function MediaScreen() {
     setHighlightMode('normal');
     setFollowOn(false);
     setFollowClip(null);
+    setPreviewList('default');
     setSummary('');
   };
 
@@ -862,6 +989,26 @@ export function MediaScreen() {
           <Text style={[styles.segmentText, kind === 'image' && styles.onAccentText]}>图片</Text>
         </Pressable>
       </View>
+      {kind === 'video' ? (
+        <View style={styles.previewSwitch}>
+          {(
+            [
+              ['default', '默认'],
+              ['all', '全部预览'],
+              ['original', '原视频'],
+              ['current', '正在处理'],
+            ] as const
+          ).map(([mode, label]) => (
+            <Pressable
+              key={mode}
+              style={[styles.zoomChip, previewList === mode && styles.zoomChipOn, previewList === mode && { backgroundColor: accent }]}
+              onPress={() => setPreviewList(mode)}
+            >
+              <Text style={[styles.zoomText, previewList === mode && styles.onAccentText]}>{label}</Text>
+            </Pressable>
+          ))}
+        </View>
+      ) : null}
       <ScrollView style={styles.list} contentContainerStyle={styles.listContent}>
         {kind === 'video' ? (
           <View style={styles.optionCard}>
@@ -1044,10 +1191,28 @@ export function MediaScreen() {
         {items.length === 0 ? (
           <Text style={styles.empty}>还没有文件。可以一次多选。</Text>
         ) : (
-          items.map((item, index) => {
+          (() => {
+            const listed =
+              kind !== 'video' || previewList === 'default' || previewList === 'all'
+                ? items
+                : previewList === 'original'
+                  ? items.filter(isOriginalPreview)
+                  : items.filter((item) => item.status === 'processing' || item.status === 'saving');
+            const forcePreview = kind === 'video' && previewList !== 'default';
+            return (
+              <>
+                {listed.length === 0 ? (
+                  <Text style={styles.empty}>
+                    {previewList === 'original' ? '还没有改存或直接保存的原视频。' : '当前没有正在处理的视频。'}
+                  </Text>
+                ) : null}
+                {listed.map((item) => {
+            const index = Math.max(0, items.findIndex((it) => it.id === item.id));
             const meta = [item.source, formatDuration(item.durationMs), formatSize(item.size)].filter(Boolean).join(' · ');
             const isSample = kind === 'image' && sample?.id === item.id;
-            const savedFolded = kind === 'video' && item.status === 'saved' && openSaved[item.id] !== true;
+            const flipFallback = kind === 'video' && item.flipFallback === true;
+            const savedFolded =
+              kind === 'video' && item.status === 'saved' && !flipFallback && !forcePreview && openSaved[item.id] !== true;
             if (savedFolded) {
               return (
                 <View key={item.id} style={styles.card}>
@@ -1065,7 +1230,7 @@ export function MediaScreen() {
             const showPreview =
               kind === 'video' &&
               Boolean(item.preview) &&
-              (previewOpen[item.id] ?? (item.status === 'processing' || item.status === 'saving'));
+              (forcePreview || flipFallback || (previewOpen[item.id] ?? (item.status === 'processing' || item.status === 'saving')));
             const active = item.status === 'processing' || item.status === 'saving';
             return (
               <View key={item.id} style={styles.card}>
@@ -1077,22 +1242,22 @@ export function MediaScreen() {
                   {meta ? <Text style={styles.cardMeta}>{meta}</Text> : null}
                   {kind === 'video' ? (
                     <View style={styles.compactRow}>
-                      {item.preview ? (
+                      {item.preview && !forcePreview ? (
                         <Pressable
                           onPress={() => setPreviewOpen((prev) => ({ ...prev, [item.id]: !showPreview }))}
                           hitSlop={8}
                         >
                           <Text style={styles.link}>{showPreview ? '收起预览' : '预览'}</Text>
                         </Pressable>
-                      ) : (
+                      ) : !item.preview ? (
                         <Text style={styles.cardMeta}>{item.preview === undefined ? '正在读取预览…' : '没有预览'}</Text>
-                      )}
-                      {item.status === 'pending' || item.status === 'processing' ? (
+                      ) : null}
+                      {item.status === 'pending' || item.status === 'processing' || item.status === 'failed' ? (
                         <Pressable onPress={() => cancelItem(item.id)} hitSlop={8}>
-                          <Text style={styles.link}>取消这条</Text>
+                          <Text style={styles.link}>{item.status === 'failed' ? '跳过这条' : '取消这条'}</Text>
                         </Pressable>
                       ) : null}
-                      {item.status === 'saved' ? (
+                      {item.status === 'saved' && !flipFallback && !forcePreview ? (
                         <Pressable onPress={() => setOpenSaved((prev) => ({ ...prev, [item.id]: false }))} hitSlop={8}>
                           <Text style={styles.link}>收起</Text>
                         </Pressable>
@@ -1102,13 +1267,36 @@ export function MediaScreen() {
                   {showPreview && item.preview ? (
                     <Image source={{ uri: item.preview }} style={styles.preview} resizeMode="cover" />
                   ) : null}
+                  {flipFallback ? (
+                    <Text style={styles.bad}>
+                      {item.status === 'saved'
+                        ? '这一条翻转失败，已自动改存原视频。上面的预览是原视频，不是翻转后的成片。'
+                        : '这一条翻转失败，原视频没能自动保存。上面的预览仍是原视频，不是翻转后的成片。'}
+                    </Text>
+                  ) : null}
                   {active ? (
                     <View style={styles.track}>
                       <View style={[styles.bar, { width: `${Math.max(4, Math.round((item.progress ?? 0) * 100))}%` }]} />
                     </View>
                   ) : null}
-                  {kind === 'video' ? (
+                  {kind === 'video' && previewList === 'default' ? (
                     <>
+                      <View style={styles.optionRow}>
+                        <Text style={styles.optionLabel}>水平翻转</Text>
+                        <Switch
+                          disabled={busy}
+                          value={item.flip !== false}
+                          onValueChange={(enabled) =>
+                            commitVideos((prev) =>
+                              prev.map((it) => (it.id === item.id ? { ...it, flip: enabled } : it)),
+                            )
+                          }
+                          trackColor={{ false: palette.switchOff, true: accent }}
+                        />
+                      </View>
+                      <Text style={styles.optionHint}>
+                        默认翻转。关掉后这一条不翻转，直接把原视频存进相册，字幕、水印、剪辑和封面都不会做。
+                      </Text>
                       <TextInput
                         value={item.subtitle ?? ''}
                         onChangeText={(text) =>
@@ -1262,8 +1450,8 @@ export function MediaScreen() {
                     <Text
                       style={[
                         styles.cardStatus,
-                        item.status === 'saved' && styles.ok,
-                        item.status === 'failed' && styles.bad,
+                        item.status === 'saved' && !item.flipFallback && styles.ok,
+                        (item.status === 'failed' || item.flipFallback) && styles.bad,
                       ]}
                     >
                       {item.message}
@@ -1313,7 +1501,10 @@ export function MediaScreen() {
                 ) : null}
               </View>
             );
-          })
+                })}
+              </>
+            );
+          })()
         )}
       </ScrollView>
       {summary ? <Text style={styles.summary}>{summary}</Text> : null}
@@ -1399,6 +1590,12 @@ function createMediaStyles(palette: Palette, accent: string) {
     borderWidth: StyleSheet.hairlineWidth,
     borderColor: palette.line,
     padding: 4,
+  },
+  previewSwitch: {
+    marginTop: 12,
+    flexDirection: 'row',
+    flexWrap: 'wrap',
+    gap: 8,
   },
   segmentItem: {
     flex: 1,
