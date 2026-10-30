@@ -27,11 +27,10 @@ export function WatermarkForm({ value, onChange, embedded, disabled }: Props) {
               patch({ enabled: false });
               return;
             }
-            const placeCenter = value.placeCenter || !value.placeLeft;
             patch({
               enabled: true,
-              placeCenter,
-              placeLeft: value.placeLeft && !placeCenter,
+              placeLeft: true,
+              placeCenter: false,
             });
           }}
           trackColor={{ false: palette.switchOff, true: accent }}
@@ -71,7 +70,7 @@ export function WatermarkForm({ value, onChange, embedded, disabled }: Props) {
             />
           </View>
           <View style={styles.row}>
-            <Text style={styles.sub}>左边</Text>
+            <Text style={styles.sub}>旁边</Text>
             <Switch
               disabled={disabled}
               value={value.placeLeft}
@@ -92,7 +91,7 @@ export function WatermarkForm({ value, onChange, embedded, disabled }: Props) {
               trackColor={{ false: palette.switchOff, true: accent }}
             />
           </View>
-          <Text style={styles.hint}>只显示一个位置。视频从第 2 秒出现，到第 6 秒隐藏。</Text>
+          <Text style={styles.hint}>只显示一个位置，打开时默认在旁边。视频从第 2 秒出现，到第 6 秒隐藏。</Text>
         </View>
       ) : null}
     </View>

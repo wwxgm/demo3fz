@@ -161,6 +161,21 @@ private enum FlipControl {
   private static var phaseEnd = 0.96
   private static var session: AVAssetExportSession?
   private static var readers: [AVAssetReader] = []
+  private static var abortHandlers: [String: () -> Void] = [:]
+
+  static func setAbort(id: String, handler: (() -> Void)?) {
+    lock.lock()
+    if id.isEmpty {
+      lock.unlock()
+      return
+    }
+    if let handler {
+      abortHandlers[id] = handler
+    } else {
+      abortHandlers.removeValue(forKey: id)
+    }
+    lock.unlock()
+  }
 
   static func reset() {
     lock.lock()
@@ -168,16 +183,35 @@ private enum FlipControl {
     cancelled.removeAll()
     progress.removeAll()
     currentJob = ""
+    let export = session
+    let reading = readers
+    session = nil
+    readers = []
+    abortHandlers.removeAll()
     lock.unlock()
+    export?.cancelExport()
+    reading.forEach { $0.cancelReading() }
   }
 
   static func begin(_ id: String) {
     guard !id.isEmpty else { return }
     lock.lock()
+    let previousId = currentJob
+    let switching = !previousId.isEmpty && previousId != id
+    let previousSession = previousId == id ? nil : session
+    let previousReaders = previousId == id ? [] : readers
+    let previousAbort = switching ? abortHandlers[previousId] : nil
+    if switching {
+      cancelled.insert(previousId)
+      readers = []
+    }
     currentJob = id
     progress[id] = 0.01
     cancelled.remove(id)
     lock.unlock()
+    previousSession?.cancelExport()
+    previousReaders.forEach { $0.cancelReading() }
+    previousAbort?()
   }
 
   static func phase(_ start: Double, _ end: Double) {
@@ -209,20 +243,27 @@ private enum FlipControl {
     return stop
   }
 
-  static func noteExport(_ fraction: Double) {
+  static func noteExport(_ fraction: Double, job: String) {
     lock.lock()
-    let id = currentJob
+    let id = job.isEmpty ? currentJob : job
+    guard !id.isEmpty, id == currentJob else {
+      lock.unlock()
+      return
+    }
     let start = phaseStart
     let end = phaseEnd
     lock.unlock()
-    guard !id.isEmpty else { return }
     setProgress(id, start + (end - start) * min(max(fraction, 0), 1))
   }
 
-  static func attach(_ export: AVAssetExportSession) {
+  static func attach(_ export: AVAssetExportSession, job: String) -> Bool {
     lock.lock()
-    session = export
+    let ok = job.isEmpty || currentJob == job
+    if ok {
+      session = export
+    }
     lock.unlock()
+    return ok
   }
 
   static func detach(_ export: AVAssetExportSession) {
@@ -252,9 +293,11 @@ private enum FlipControl {
     }
     let export = currentJob == id || id.isEmpty ? session : nil
     let reading = currentJob == id || id.isEmpty ? readers : []
+    let handler = abortHandlers[id]
     lock.unlock()
     export?.cancelExport()
     reading.forEach { $0.cancelReading() }
+    handler?()
   }
 
   static func cancelAll() {
@@ -265,9 +308,11 @@ private enum FlipControl {
     }
     let export = session
     let reading = readers
+    let handlers = Array(abortHandlers.values)
     lock.unlock()
     export?.cancelExport()
     reading.forEach { $0.cancelReading() }
+    handlers.forEach { $0() }
   }
 }
 
@@ -473,13 +518,14 @@ private enum VideoFlipper {
           speech: speechTrack,
           speechDuration: min(speechDuration, max(safeDuration.seconds - 1.0 / 30.0, 0))
         ),
-        outputURL: outputURL
+        outputURL: outputURL,
+        jobId: jobId
       )
     } catch {
       guard allowRepack, isBrokenTiming(error) else { throw error }
       let packed: URL
       do {
-        packed = try await repackCompressed(sourceURL)
+        packed = try await repackCompressed(sourceURL, jobId: jobId)
       } catch {
         throw VideoFlipError.exportFailed("这个视频的画面时间不连续，系统没法按原样翻转（-11880）")
       }
@@ -499,7 +545,8 @@ private enum VideoFlipper {
           source: outputURL,
           options: options,
           subtitle: subtitle,
-          speechDuration: speechDuration
+          speechDuration: speechDuration,
+          jobId: jobId
         )
       }
       return outputURL.absoluteString
@@ -509,7 +556,7 @@ private enum VideoFlipper {
       .appendingPathComponent("flipped-look-\(UUID().uuidString).mp4")
     do {
       FlipControl.phase(0.62, overlay ? 0.78 : 0.96)
-      try await applyLook(source: outputURL, output: filtered, name: filterName)
+      try await applyLook(source: outputURL, output: filtered, name: filterName, jobId: jobId)
       try? FileManager.default.removeItem(at: outputURL)
     } catch {
       try? FileManager.default.removeItem(at: filtered)
@@ -524,7 +571,8 @@ private enum VideoFlipper {
         source: filtered,
         options: options,
         subtitle: subtitle,
-        speechDuration: speechDuration
+        speechDuration: speechDuration,
+        jobId: jobId
       )
     } catch {
       try? FileManager.default.removeItem(at: filtered)
@@ -569,7 +617,7 @@ private enum VideoFlipper {
     )
   }
 
-  private static func applyLook(source: URL, output: URL, name: String) async throws {
+  private static func applyLook(source: URL, output: URL, name: String, jobId: String) async throws {
     let asset = AVURLAsset(url: source)
     guard let videoTrack = try await asset.loadTracks(withMediaType: .video).first else {
       throw VideoFlipError.noVideoTrack
@@ -602,7 +650,8 @@ private enum VideoFlipper {
       composition: composition,
       videoComposition: videoComposition,
       audioMix: nil,
-      outputURL: output
+      outputURL: output,
+      jobId: jobId
     )
   }
 
@@ -610,7 +659,8 @@ private enum VideoFlipper {
     source: URL,
     options: [String: Any],
     subtitle: String,
-    speechDuration: Double
+    speechDuration: Double,
+    jobId: String
   ) async throws -> String {
     let asset = AVURLAsset(url: source)
     guard let videoTrack = try await asset.loadTracks(withMediaType: .video).first else {
@@ -670,7 +720,8 @@ private enum VideoFlipper {
       composition: composition,
       videoComposition: videoComposition,
       audioMix: nil,
-      outputURL: output
+      outputURL: output,
+      jobId: jobId
     )
     try? FileManager.default.removeItem(at: source)
     return output.absoluteString
@@ -721,7 +772,8 @@ private enum VideoFlipper {
     composition: AVMutableComposition,
     videoComposition: AVVideoComposition,
     audioMix: AVMutableAudioMix?,
-    outputURL: URL
+    outputURL: URL,
+    jobId: String
   ) async throws {
     if FileManager.default.fileExists(atPath: outputURL.path) {
       try? FileManager.default.removeItem(at: outputURL)
@@ -739,7 +791,7 @@ private enum VideoFlipper {
     }
     var last = "导出失败"
     for preset in presets {
-      if FlipControl.shouldStop("") {
+      if FlipControl.shouldStop(jobId) {
         throw VideoFlipError.exportFailed("翻转已取消")
       }
       if FileManager.default.fileExists(atPath: outputURL.path) {
@@ -750,7 +802,8 @@ private enum VideoFlipper {
         videoComposition: videoComposition,
         audioMix: audioMix,
         outputURL: outputURL,
-        preset: preset
+        preset: preset,
+        jobId: jobId
       )
       if outcome == nil, FileManager.default.fileExists(atPath: outputURL.path) {
         return
@@ -772,7 +825,8 @@ private enum VideoFlipper {
     videoComposition: AVVideoComposition,
     audioMix: AVMutableAudioMix?,
     outputURL: URL,
-    preset: String
+    preset: String,
+    jobId: String
   ) async -> String? {
     await withCheckedContinuation { continuation in
       DispatchQueue.main.async {
@@ -785,42 +839,70 @@ private enum VideoFlipper {
         exportSession.videoComposition = videoComposition
         exportSession.audioMix = audioMix
         exportSession.shouldOptimizeForNetworkUse = false
-        FlipControl.attach(exportSession)
+        guard FlipControl.attach(exportSession, job: jobId) else {
+          continuation.resume(returning: "翻转已取消")
+          return
+        }
         let gate = OnceGate()
-        let timer = DispatchSource.makeTimerSource(queue: .main)
+        let timer = DispatchSource.makeTimerSource(queue: DispatchQueue.global(qos: .utility))
+        let cancelSource = DispatchSource.makeTimerSource(queue: DispatchQueue.global(qos: .userInitiated))
         var lastProgress: Float = -1
         var lastChange = Date()
+        let stopThisExport = {
+          exportSession.cancelExport()
+          DispatchQueue.main.async {
+            gate.run {
+              timer.cancel()
+              cancelSource.cancel()
+              FlipControl.detach(exportSession)
+              FlipControl.setAbort(id: jobId, handler: nil)
+              continuation.resume(returning: "翻转已取消")
+            }
+          }
+        }
+        FlipControl.setAbort(id: jobId, handler: stopThisExport)
         timer.schedule(deadline: .now() + 0.4, repeating: 0.4)
         timer.setEventHandler {
+          if FlipControl.shouldStop(jobId) {
+            stopThisExport()
+            return
+          }
           let fraction = exportSession.progress
           if abs(fraction - lastProgress) > 0.002 {
             lastProgress = fraction
             lastChange = Date()
           }
-          FlipControl.noteExport(Double(fraction))
-          if FlipControl.shouldStop("") {
-            exportSession.cancelExport()
-          }
+          FlipControl.noteExport(Double(fraction), job: jobId)
           if Date().timeIntervalSince(lastChange) > 60 {
             exportSession.cancelExport()
             gate.run {
               timer.cancel()
+              cancelSource.cancel()
               FlipControl.detach(exportSession)
+              FlipControl.setAbort(id: jobId, handler: nil)
               continuation.resume(returning: "这一条长时间没有进展，已停止")
             }
           }
         }
         timer.resume()
+        cancelSource.schedule(deadline: .now() + 0.2, repeating: 0.2)
+        cancelSource.setEventHandler {
+          guard FlipControl.shouldStop(jobId) else { return }
+          stopThisExport()
+        }
+        cancelSource.resume()
         exportSession.exportAsynchronously {
           DispatchQueue.main.async {
             gate.run {
               timer.cancel()
+              cancelSource.cancel()
               FlipControl.detach(exportSession)
+              FlipControl.setAbort(id: jobId, handler: nil)
               switch exportSession.status {
               case .completed:
                 continuation.resume(returning: nil)
               case .cancelled:
-                if FlipControl.shouldStop("") {
+                if FlipControl.shouldStop(jobId) {
                   continuation.resume(returning: "翻转已取消")
                 } else {
                   continuation.resume(returning: "这一条长时间没有进展，已停止")
@@ -861,7 +943,7 @@ private enum VideoFlipper {
   }
 
   /// 不抽帧。只把压缩数据按原样重新封装，修掉坏掉的画面索引，再走原来的翻转。
-  private static func repackCompressed(_ url: URL) async throws -> URL {
+  private static func repackCompressed(_ url: URL, jobId: String) async throws -> URL {
     let asset = AVURLAsset(url: url)
     guard let videoTrack = try await asset.loadTracks(withMediaType: .video).first else {
       throw VideoFlipError.noVideoTrack
@@ -926,17 +1008,27 @@ private enum VideoFlipper {
 
     do {
       try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+        let gate = OnceGate()
+        let end: (Error?) -> Void = { error in
+          gate.run {
+            if let error {
+              continuation.resume(throwing: error)
+            } else {
+              continuation.resume()
+            }
+          }
+        }
         let queue = DispatchQueue(label: "flip.repack")
         var finished = false
         var pending: CMSampleBuffer? = first
         var wroteVideo = false
         videoInput.requestMediaDataWhenReady(on: queue) {
           while videoInput.isReadyForMoreMediaData && !finished {
-            if FlipControl.shouldStop("") {
+            if FlipControl.shouldStop(jobId) {
               finished = true
               reader.cancelReading()
               writer.cancelWriting()
-              continuation.resume(throwing: VideoFlipError.exportFailed("翻转已取消"))
+              end(VideoFlipError.exportFailed("翻转已取消"))
               return
             }
             let sample: CMSampleBuffer
@@ -949,15 +1041,15 @@ private enum VideoFlipper {
               finished = true
               videoInput.markAsFinished()
               if reader.status == .failed || !wroteVideo {
-                continuation.resume(throwing: VideoFlipError.exportFailed(reader.error?.localizedDescription ?? "这个视频的画面时间不连续，系统没法按原样翻转（-11880）"))
+                end(VideoFlipError.exportFailed(reader.error?.localizedDescription ?? "这个视频的画面时间不连续，系统没法按原样翻转（-11880）"))
                 return
               }
               guard let audioInput, let audioTrack, audioHint != nil else {
                 writer.finishWriting {
                   if writer.status == .completed {
-                    continuation.resume()
+                    end(nil)
                   } else {
-                    continuation.resume(throwing: VideoFlipError.exportFailed(writer.error?.localizedDescription ?? "这个视频的画面时间不连续，系统没法按原样翻转（-11880）"))
+                    end(VideoFlipError.exportFailed(writer.error?.localizedDescription ?? "这个视频的画面时间不连续，系统没法按原样翻转（-11880）"))
                   }
                 }
                 return
@@ -969,9 +1061,9 @@ private enum VideoFlipper {
               } catch {
                 writer.finishWriting {
                   if writer.status == .completed {
-                    continuation.resume()
+                    end(nil)
                   } else {
-                    continuation.resume(throwing: VideoFlipError.exportFailed(writer.error?.localizedDescription ?? "这个视频的画面时间不连续，系统没法按原样翻转（-11880）"))
+                    end(VideoFlipError.exportFailed(writer.error?.localizedDescription ?? "这个视频的画面时间不连续，系统没法按原样翻转（-11880）"))
                   }
                 }
                 return
@@ -981,9 +1073,9 @@ private enum VideoFlipper {
               guard audioReader.canAdd(audioSampleOutput) else {
                 writer.finishWriting {
                   if writer.status == .completed {
-                    continuation.resume()
+                    end(nil)
                   } else {
-                    continuation.resume(throwing: VideoFlipError.exportFailed(writer.error?.localizedDescription ?? "这个视频的画面时间不连续，系统没法按原样翻转（-11880）"))
+                    end(VideoFlipError.exportFailed(writer.error?.localizedDescription ?? "这个视频的画面时间不连续，系统没法按原样翻转（-11880）"))
                   }
                 }
                 return
@@ -992,29 +1084,30 @@ private enum VideoFlipper {
               guard audioReader.startReading() else {
                 writer.finishWriting {
                   if writer.status == .completed {
-                    continuation.resume()
+                    end(nil)
                   } else {
-                    continuation.resume(throwing: VideoFlipError.exportFailed(writer.error?.localizedDescription ?? "这个视频的画面时间不连续，系统没法按原样翻转（-11880）"))
+                    end(VideoFlipError.exportFailed(writer.error?.localizedDescription ?? "这个视频的画面时间不连续，系统没法按原样翻转（-11880）"))
                   }
                 }
                 return
               }
               audioInput.requestMediaDataWhenReady(on: queue) {
                 while audioInput.isReadyForMoreMediaData {
-                  if FlipControl.shouldStop("") {
+                  if FlipControl.shouldStop(jobId) {
+                    finished = true
                     reader.cancelReading()
                     audioReader.cancelReading()
                     writer.cancelWriting()
-                    continuation.resume(throwing: VideoFlipError.exportFailed("翻转已取消"))
+                    end(VideoFlipError.exportFailed("翻转已取消"))
                     return
                   }
                   guard let audioSample = audioSampleOutput.copyNextSampleBuffer() else {
                     audioInput.markAsFinished()
                     writer.finishWriting {
                       if writer.status == .completed {
-                        continuation.resume()
+                        end(nil)
                       } else {
-                        continuation.resume(throwing: VideoFlipError.exportFailed(writer.error?.localizedDescription ?? "这个视频的画面时间不连续，系统没法按原样翻转（-11880）"))
+                        end(VideoFlipError.exportFailed(writer.error?.localizedDescription ?? "这个视频的画面时间不连续，系统没法按原样翻转（-11880）"))
                       }
                     }
                     return
@@ -1029,9 +1122,9 @@ private enum VideoFlipper {
                   audioInput.markAsFinished()
                   writer.finishWriting {
                     if writer.status == .completed {
-                      continuation.resume()
+                      end(nil)
                     } else {
-                      continuation.resume(throwing: VideoFlipError.exportFailed(writer.error?.localizedDescription ?? "这个视频的画面时间不连续，系统没法按原样翻转（-11880）"))
+                      end(VideoFlipError.exportFailed(writer.error?.localizedDescription ?? "这个视频的画面时间不连续，系统没法按原样翻转（-11880）"))
                     }
                   }
                   return
@@ -1045,7 +1138,7 @@ private enum VideoFlipper {
             }
             finished = true
             videoInput.markAsFinished()
-            continuation.resume(throwing: VideoFlipError.exportFailed(writer.error?.localizedDescription ?? "这个视频的画面时间不连续，系统没法按原样翻转（-11880）"))
+            end(VideoFlipError.exportFailed(writer.error?.localizedDescription ?? "这个视频的画面时间不连续，系统没法按原样翻转（-11880）"))
             return
           }
         }

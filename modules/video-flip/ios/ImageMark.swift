@@ -26,16 +26,16 @@ enum MarkConfigParser {
       fontSize: cg(raw["fontSize"]) ?? 16,
       opacity: cg(raw["opacity"]) ?? 0.25,
       move: bool(raw["move"], default: true),
-      placeLeft: bool(raw["placeLeft"], default: false),
-      placeCenter: bool(raw["placeCenter"], default: true),
+      placeLeft: bool(raw["placeLeft"], default: true),
+      placeCenter: bool(raw["placeCenter"], default: false),
       flip: bool(options["flip"]),
       crop: nil
     )
     if config.placeLeft && config.placeCenter {
-      config.placeLeft = false
+      config.placeCenter = false
     }
     if !config.placeLeft && !config.placeCenter {
-      config.placeCenter = true
+      config.placeLeft = true
     }
     config.opacity = min(max(config.opacity, 0.08), 0.6)
     config.fontSize = min(max(config.fontSize, 10), 72)

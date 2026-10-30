@@ -23,8 +23,8 @@ export const defaultWatermark: WatermarkSettings = {
   fontSize: 16,
   opacity: 0.25,
   move: true,
-  placeLeft: false,
-  placeCenter: true,
+  placeLeft: true,
+  placeCenter: false,
 };
 
 export function watermarkPayload(settings: WatermarkSettings) {
