@@ -61,6 +61,10 @@ public class VideoFlipModule: Module {
       try await PageLoader.load(url: url, referer: referer)
     }
 
+    Function("sourceReady") { (uri: String) -> Bool in
+      VideoFlipper.sourceReady(uri)
+    }
+
     AsyncFunction("stageOriginal") { (uri: String) async throws -> String in
       try VideoFlipper.stageOriginal(uri)
     }
@@ -873,7 +877,7 @@ private enum VideoFlipper {
             lastChange = Date()
           }
           FlipControl.noteExport(Double(fraction), job: jobId)
-          if Date().timeIntervalSince(lastChange) > 60 {
+          if Date().timeIntervalSince(lastChange) > 20 {
             exportSession.cancelExport()
             gate.run {
               timer.cancel()
@@ -1263,6 +1267,23 @@ private enum VideoFlipper {
       return nil
     }
     return number.doubleValue
+  }
+
+  static func sourceReady(_ uri: String) -> Bool {
+    guard let source = try? resolveFileURL(uri) else {
+      return true
+    }
+    let accessed = source.startAccessingSecurityScopedResource()
+    defer {
+      if accessed {
+        source.stopAccessingSecurityScopedResource()
+      }
+    }
+    guard FileManager.default.fileExists(atPath: source.path) else {
+      return false
+    }
+    let size = (try? FileManager.default.attributesOfItem(atPath: source.path)[.size] as? NSNumber)?.int64Value ?? 0
+    return size > 0
   }
 
   static func stageOriginal(_ uri: String) throws -> String {

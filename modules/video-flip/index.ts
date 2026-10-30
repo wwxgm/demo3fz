@@ -78,6 +78,7 @@ type VideoFlipNative = {
   }): Promise<string>;
   loadPage(url: string, referer: string): Promise<string>;
   stageOriginal(uri: string): Promise<string>;
+  sourceReady(uri: string): boolean;
   prepareFlipBatch(): void;
   flipProgress(id: string): number;
   cancelFlip(id: string): void;
@@ -121,6 +122,9 @@ const missing: VideoFlipNative = {
   },
   async stageOriginal() {
     throw new Error(missingMessage);
+  },
+  sourceReady() {
+    return false;
   },
   prepareFlipBatch() {},
   flipProgress() {

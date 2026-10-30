@@ -53,6 +53,8 @@ type MediaItem = {
   sampleFrames?: boolean;
   /** 默认翻转。false 表示这一条不翻转，直接保存原视频。 */
   flip?: boolean;
+  /** 选中时文件就读不到，处理到它时不再尝试翻转。 */
+  unreadable?: boolean;
   /** 翻转失败后自动改存的原视频，用来和正常翻转换成片区分。 */
   flipFallback?: boolean;
   cover?: boolean;
@@ -109,6 +111,18 @@ function isOriginalPreview(item: MediaItem) {
   return item.originalSaved === true && item.status !== 'saved';
 }
 
+function isAbnormalVideo(item: MediaItem) {
+  return item.flipFallback === true || item.unreadable === true || item.status === 'failed';
+}
+
+function sourceReady(uri: string) {
+  try {
+    return VideoFlip.sourceReady(uri);
+  } catch {
+    return true;
+  }
+}
+
 function formatDuration(durationMs?: number) {
   if (!durationMs || durationMs <= 0) return '';
   const total = Math.round(durationMs / 1000);
@@ -148,11 +162,15 @@ export function MediaScreen() {
   const [openSaved, setOpenSaved] = useState<Record<string, boolean>>({});
   const [previewOpen, setPreviewOpen] = useState<Record<string, boolean>>({});
   const [previewList, setPreviewList] = useState<'default' | 'all' | 'original' | 'current'>('default');
+  const [errorLogs, setErrorLogs] = useState<{ id: string; name: string; at: string; message: string }[]>([]);
+  const [logOpen, setLogOpen] = useState(false);
   const [batchWatermark, setBatchWatermark] = useState(false);
   const videosRef = useRef<MediaItem[]>([]);
   const nativeTail = useRef(Promise.resolve());
   const stopRef = useRef(false);
   const cancelledRef = useRef(new Set<string>());
+  const stallRef = useRef(new Set<string>());
+  const retryIdsRef = useRef(new Set<string>());
   const runningRef = useRef(false);
   const exportingRef = useRef(false);
   const previewBusy = useRef(false);
@@ -302,18 +320,30 @@ export function MediaScreen() {
         return;
       }
       const next: MediaItem[] = [];
-      result.assets.forEach((asset, index) => {
+      for (const [index, asset] of result.assets.entries()) {
         const matched = kind === 'video' ? isVideo(asset.name, asset.mimeType) : isImage(asset.name, asset.mimeType);
-        if (!matched) return;
+        if (!matched) continue;
+        let uri = asset.uri;
+        let unreadable = false;
+        if (kind === 'video') {
+          setSummary(`正在确认文件：${asset.name}`);
+          try {
+            uri = await VideoFlip.stageOriginal(asset.uri);
+          } catch {
+            unreadable = true;
+          }
+        }
         next.push({
           id: `${Date.now()}-${kind}-file-${index}-${asset.name}`,
-          uri: asset.uri,
+          uri,
           name: asset.name,
           size: asset.size,
           source: '文件',
           status: 'pending',
+          unreadable,
+          message: unreadable ? `「${asset.name}」选中时没有读到文件。处理到它会直接尝试保存，读不到就跳过。` : undefined,
         });
-      });
+      }
       addItems(next, kind);
       setSummary('');
     } catch (error) {
@@ -372,25 +402,30 @@ export function MediaScreen() {
     return true;
   };
 
-  const run = async () => {
+  const run = async (options?: { abnormalOnly?: boolean }) => {
     if (running || picking) return;
-    if (kind === 'video') {
+    const abnormalOnly = options?.abnormalOnly === true;
+    if (kind === 'video' && !abnormalOnly) {
+      retryIdsRef.current = new Set();
       commitVideos((prev) =>
         prev.map((it) =>
           it.status === 'failed' || it.status === 'cancelled'
-            ? { ...it, status: 'pending', message: undefined, progress: 0, flipFallback: undefined }
+            ? { ...it, status: 'pending', message: undefined, progress: 0 }
             : it,
         ),
       );
     }
     const sourceItems = kind === 'video' ? videosRef.current : items;
-    const queue = sourceItems.filter((item) => item.status !== 'saved');
+    let queue = sourceItems.filter((item) => item.status !== 'saved');
+    if (abnormalOnly) {
+      queue = sourceItems.filter((item) => retryIdsRef.current.has(item.id));
+    }
     if (items.length === 0) {
       Alert.alert(kind === 'video' ? '还没有视频' : '还没有图片', '请先从相册或文件里选择。');
       return;
     }
     if (queue.length === 0) {
-      Alert.alert('已经保存', '当前这些都已经保存到相册。');
+      Alert.alert(abnormalOnly ? '没有异常视频' : '已经保存', abnormalOnly ? '当前没有翻转失败或读不到的视频。' : '当前这些都已经保存到相册。');
       return;
     }
     if (Platform.OS !== 'ios') {
@@ -401,7 +436,7 @@ export function MediaScreen() {
     const start = Number(clipStart);
     const end = Number(clipEnd);
     const freeze = Number(freezeSeconds);
-    if (kind === 'video' && extendVideo && useCurrentClip) {
+    if (kind === 'video' && !abnormalOnly && extendVideo && useCurrentClip) {
       if (!Number.isFinite(start) || !Number.isFinite(end) || !Number.isFinite(freeze) || end <= start || start < 0 || freeze < 0.5) {
         Alert.alert('请检查延长时间', '开始要小于结束，定格至少 0.5 秒。');
         return;
@@ -412,11 +447,11 @@ export function MediaScreen() {
         return;
       }
     }
-    if (kind === 'video' && followOn && !followClip) {
+    if (kind === 'video' && !abnormalOnly && followOn && !followClip) {
       Alert.alert('还没有关注片段', '请先上传末尾要接上的视频，或关掉这个开关。');
       return;
     }
-    if (kind === 'video') {
+    if (kind === 'video' && !abnormalOnly) {
       const invalidCut = queue.find((item) => {
         if (item.flip === false || !item.cut) return false;
         const start = Number(item.cut.start);
@@ -440,6 +475,23 @@ export function MediaScreen() {
     }
     const allowed = await ensurePermission();
     if (!allowed) return;
+    if (abnormalOnly) {
+      commitVideos((prev) =>
+        prev.map((it) =>
+          retryIdsRef.current.has(it.id)
+            ? {
+                ...it,
+                status: 'pending',
+                progress: 0,
+                message: undefined,
+                flip: true,
+                flipFallback: undefined,
+                unreadable: undefined,
+              }
+            : it,
+        ),
+      );
+    }
 
     const heavy =
       kind === 'video' &&
@@ -464,28 +516,47 @@ export function MediaScreen() {
       return stopRef.current || text.includes('已取消') || text.includes('已停止');
     };
 
+    const noteError = (name: string, message: string) => {
+      if (!abnormalOnly) return;
+      const at = new Date();
+      const stamp = `${at.getHours()}:${String(at.getMinutes()).padStart(2, '0')}:${String(at.getSeconds()).padStart(2, '0')}`;
+      setErrorLogs((prev) => [...prev, { id: `${Date.now()}-${prev.length}-${name}`, name, at: stamp, message }]);
+    };
+
     if (kind === 'video') {
       stopRef.current = false;
       cancelledRef.current = new Set();
+      stallRef.current = new Set();
       VideoFlip.prepareFlipBatch();
       while (!stopRef.current) {
-        const item = videosRef.current.find((it) => it.status === 'pending' && !cancelledRef.current.has(it.id));
+        const item = videosRef.current.find(
+          (it) =>
+            it.status === 'pending' &&
+            !cancelledRef.current.has(it.id) &&
+            (!abnormalOnly || retryIdsRef.current.has(it.id)),
+        );
         if (!item) break;
         commitVideos((prev) =>
           prev.map((it) =>
             it.id === item.id ? { ...it, status: 'processing', message: '正在转换…', progress: 0.01 } : it,
           ),
         );
+        const startedAt = Date.now();
         let lastProgress = -1;
-        let lastMove = Date.now();
+        let lastMove = startedAt;
         const timer = setInterval(() => {
           const value = VideoFlip.flipProgress(item.id);
           if (Math.abs(value - lastProgress) > 0.002) {
             lastProgress = value;
             lastMove = Date.now();
           }
-          const moved = lastProgress > 0.03;
-          const stalled = Date.now() - lastMove > (moved ? 12000 : 20000);
+          const stalled = Date.now() - lastMove > 20000;
+          const used = Math.max(1, Math.floor((Date.now() - startedAt) / 1000));
+          const remain = Math.max(0, Math.ceil((20000 - (Date.now() - lastMove)) / 1000));
+          if (stalled && !stallRef.current.has(item.id) && !cancelledRef.current.has(item.id)) {
+            stallRef.current.add(item.id);
+            VideoFlip.cancelFlip(item.id);
+          }
           commitVideos((prev) =>
             prev.map((it) => {
               if (it.id !== item.id || it.status !== 'processing') return it;
@@ -493,10 +564,8 @@ export function MediaScreen() {
                 ...it,
                 progress: value,
                 message: stalled
-                  ? '进度停住了。可以取消这一条，再把原视频保存到相册，后面的会继续。'
-                  : it.message?.startsWith('进度停住了')
-                    ? '正在转换…'
-                    : it.message,
+                  ? '进度已停满 20 秒，正在自动改存原视频…'
+                  : `正在转换… 本条已用 ${used} 秒，进度停住还剩 ${remain} 秒`,
               };
             }),
           );
@@ -581,6 +650,11 @@ export function MediaScreen() {
               ),
             );
           } else {
+          const currentUri = (videosRef.current.find((it) => it.id === item.id) ?? item).uri;
+          const readable = !item.unreadable && sourceReady(currentUri);
+          if (!readable) {
+            throw new Error('这个文件已经读不到');
+          }
           outputUri = await withExport(() =>
             withNative(() =>
               abandonIfStopped(item.id, () =>
@@ -674,7 +748,8 @@ export function MediaScreen() {
           );
           }
         } catch (error) {
-          if (stopped(error) || cancelledRef.current.has(item.id)) {
+          const stalledJob = stallRef.current.has(item.id);
+          if (!stalledJob && (stopped(error) || cancelledRef.current.has(item.id))) {
             const text = errorText(error);
             if (text.includes('长时间没有进展')) {
               holdOriginal = !stopRef.current;
@@ -698,10 +773,17 @@ export function MediaScreen() {
             }
           } else if (keepStraight) {
             failed += 1;
+            setPreviewOpen((prev) => ({ ...prev, [item.id]: true }));
             commitVideos((prev) =>
               prev.map((it) =>
                 it.id === item.id
-                  ? { ...it, status: 'failed', progress: 0, message: `原视频没有保存。${errorText(error)}` }
+                  ? {
+                      ...it,
+                      status: 'failed',
+                      progress: 0,
+                      flipFallback: true,
+                      message: `「${item.name}」原视频没有保存。${errorText(error)}。后面的视频会继续。`,
+                    }
                   : it,
               ),
             );
@@ -733,6 +815,7 @@ export function MediaScreen() {
             });
             saved += 1;
             setPreviewOpen((prev) => ({ ...prev, [item.id]: true }));
+            noteError(item.name, `翻转异常：${reason}\n已自动改存原视频。`);
             commitVideos((prev) =>
               prev.map((it) =>
                 it.id === item.id
@@ -742,7 +825,7 @@ export function MediaScreen() {
                       progress: 1,
                       originalSaved: true,
                       flipFallback: true,
-                      message: `翻转失败，已自动保存原视频。原因：${reason}`,
+                      message: `「${item.name}」翻转失败，已自动保存原视频。上面的预览就是这一条。原因：${reason}`,
                     }
                   : it,
               ),
@@ -760,6 +843,12 @@ export function MediaScreen() {
             } else {
               failed += 1;
               setPreviewOpen((prev) => ({ ...prev, [item.id]: true }));
+              const detail = `${reason}。${errorText(error)}`;
+              const gone = /找不到|不存在|读不到/.test(detail);
+              noteError(
+                item.name,
+                gone ? `翻转异常：${reason}\n原视频读不到，没有放进相册。` : `翻转异常：${detail}`,
+              );
               commitVideos((prev) =>
                 prev.map((it) =>
                   it.id === item.id
@@ -768,7 +857,9 @@ export function MediaScreen() {
                         status: 'failed',
                         progress: 0,
                         flipFallback: true,
-                        message: `翻转失败，原视频也没有保存成功。原因：${reason}。${errorText(error)}`,
+                        message: gone
+                          ? `「${item.name}」这个文件已经读不到，没法放进相册。上面如果有预览，就是选中时留下的画面。后面的视频会继续。`
+                          : `「${item.name}」翻转失败，原视频也没有保存成功。${detail}。后面的视频会继续。`,
                       }
                     : it,
                 ),
@@ -878,18 +969,42 @@ export function MediaScreen() {
       };
       activeAbort.current = { id, abort };
       const watch = setInterval(() => {
+        if (stallRef.current.has(id)) {
+          VideoFlip.cancelFlip(id);
+          finish(new Error('这一条长时间没有进展，已停止'));
+          return;
+        }
         if (stopRef.current || cancelledRef.current.has(id)) abort();
       }, 200);
       job().then(
         (value) => finish(undefined, value),
-        (error) => finish(error),
+        (error) => {
+          if (stallRef.current.has(id)) finish(new Error('这一条长时间没有进展，已停止'));
+          else finish(error);
+        },
       );
     });
 
   const pendingCount = items.filter((item) => item.status !== 'saved').length;
 
+  const retryAbnormal = () => {
+    if (running || picking) return;
+    const targets = videosRef.current.filter(isAbnormalVideo);
+    if (targets.length === 0) {
+      Alert.alert('没有异常视频', '当前没有翻转失败或读不到的视频。');
+      return;
+    }
+    retryIdsRef.current = new Set(targets.map((item) => item.id));
+    setLogOpen(true);
+    void run({ abnormalOnly: true });
+  };
+
   const refreshVideo = () => {
     if (running || picking) return;
+    videosRef.current.forEach((item) => {
+      if (item.preview) VideoFlip.removeTempFile(item.preview);
+      VideoFlip.removeTempFile(item.uri);
+    });
     setKind('video');
     commitVideos([]);
     setWatermark(defaultWatermark);
@@ -1007,6 +1122,18 @@ export function MediaScreen() {
               <Text style={[styles.zoomText, previewList === mode && styles.onAccentText]}>{label}</Text>
             </Pressable>
           ))}
+          <Pressable
+            disabled={running || picking}
+            style={[styles.zoomChip, (running || picking) && styles.primaryDisabled]}
+            onPress={retryAbnormal}
+          >
+            <Text style={styles.zoomText}>重试异常</Text>
+          </Pressable>
+          {errorLogs.length > 0 ? (
+            <Pressable style={styles.zoomChip} onPress={() => setLogOpen(true)}>
+              <Text style={styles.zoomText}>异常记录</Text>
+            </Pressable>
+          ) : null}
         </View>
       ) : null}
       <ScrollView style={styles.list} contentContainerStyle={styles.listContent}>
@@ -1174,9 +1301,10 @@ export function MediaScreen() {
             <Pressable
               onPress={() => {
                 if (kind === 'video') {
-                  videosRef.current.forEach((item) => {
-                    if (item.preview) VideoFlip.removeTempFile(item.preview);
-                  });
+                    videosRef.current.forEach((item) => {
+                      if (item.preview) VideoFlip.removeTempFile(item.preview);
+                      VideoFlip.removeTempFile(item.uri);
+                    });
                   commitVideos([]);
                 } else {
                   setItems([]);
@@ -1270,8 +1398,8 @@ export function MediaScreen() {
                   {flipFallback ? (
                     <Text style={styles.bad}>
                       {item.status === 'saved'
-                        ? '这一条翻转失败，已自动改存原视频。上面的预览是原视频，不是翻转后的成片。'
-                        : '这一条翻转失败，原视频没能自动保存。上面的预览仍是原视频，不是翻转后的成片。'}
+                        ? `「${item.name}」翻转失败，已自动改存原视频。上面的预览就是这一条，不是翻转后的成片。`
+                        : `「${item.name}」这个文件有问题。上面如果有预览，就是这一条选中时留下的画面，不是翻转后的成片。`}
                     </Text>
                   ) : null}
                   {active ? (
@@ -1487,6 +1615,7 @@ export function MediaScreen() {
                   <Pressable
                     onPress={() => {
                       if (item.preview) VideoFlip.removeTempFile(item.preview);
+                      VideoFlip.removeTempFile(item.uri);
                       if (kind === 'video') {
                         commitVideos((prev) => prev.filter((it) => it.id !== item.id));
                       } else {
@@ -1508,6 +1637,29 @@ export function MediaScreen() {
         )}
       </ScrollView>
       {summary ? <Text style={styles.summary}>{summary}</Text> : null}
+      {logOpen ? (
+        <View style={styles.logPanel}>
+          <View style={styles.logHead}>
+            <Text style={styles.optionLabel}>异常记录</Text>
+            <Pressable onPress={() => setLogOpen(false)} hitSlop={8}>
+              <Text style={styles.link}>关闭</Text>
+            </Pressable>
+          </View>
+          <ScrollView style={styles.logList}>
+            {errorLogs.length === 0 ? (
+              <Text style={styles.optionHint}>重试后如果再失败，翻转抛出的异常会写在这里。</Text>
+            ) : (
+              errorLogs.map((entry) => (
+                <Text key={entry.id} style={styles.logLine}>
+                  {entry.at}  {entry.name}
+                  {'\n'}
+                  {entry.message}
+                </Text>
+              ))
+            )}
+          </ScrollView>
+        </View>
+      ) : null}
       <View style={styles.footer}>
         {running && kind === 'video' ? (
           <Pressable style={[styles.primary, { backgroundColor: accent }]} onPress={stopAll}>
@@ -1596,6 +1748,30 @@ function createMediaStyles(palette: Palette, accent: string) {
     flexDirection: 'row',
     flexWrap: 'wrap',
     gap: 8,
+  },
+  logPanel: {
+    maxHeight: 220,
+    marginTop: 8,
+    borderRadius: 12,
+    backgroundColor: palette.card,
+    borderWidth: StyleSheet.hairlineWidth,
+    borderColor: palette.line,
+    padding: 12,
+  },
+  logHead: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+  },
+  logList: {
+    marginTop: 8,
+    maxHeight: 150,
+  },
+  logLine: {
+    color: '#B42318',
+    fontSize: 13,
+    lineHeight: 18,
+    marginBottom: 8,
   },
   segmentItem: {
     flex: 1,
