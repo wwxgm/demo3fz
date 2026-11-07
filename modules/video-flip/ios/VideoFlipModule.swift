@@ -1,6 +1,26 @@
 import AVFoundation
 import ExpoModulesCore
 
+enum InstallExpiry {
+  /// 读不到描述文件时返回 -999。免费签名的到期时间写在 embedded.mobileprovision 里。
+  static func daysLeft() -> Double {
+    guard let url = Bundle.main.url(forResource: "embedded", withExtension: "mobileprovision"),
+          let data = try? Data(contentsOf: url),
+          let raw = String(data: data, encoding: .isoLatin1),
+          let start = raw.range(of: "<?xml"),
+          let end = raw.range(of: "</plist>") else {
+      return -999
+    }
+    let xml = String(raw[start.lowerBound..<end.upperBound])
+    guard let xmlData = xml.data(using: .utf8),
+          let plist = try? PropertyListSerialization.propertyList(from: xmlData, format: nil) as? [String: Any],
+          let date = plist["ExpirationDate"] as? Date else {
+      return -999
+    }
+    return date.timeIntervalSinceNow / 86_400
+  }
+}
+
 public class VideoFlipModule: Module {
   public func definition() -> ModuleDefinition {
     Name("VideoFlip")
@@ -59,6 +79,10 @@ public class VideoFlipModule: Module {
 
     AsyncFunction("loadPage") { (url: String, referer: String) async throws -> String in
       try await PageLoader.load(url: url, referer: referer)
+    }
+
+    Function("installDaysLeft") { () -> Double in
+      InstallExpiry.daysLeft()
     }
 
     Function("sourceReady") { (uri: String) -> Bool in
@@ -421,28 +445,31 @@ private enum VideoFlipper {
       }
     }
     if !subtitle.isEmpty {
-      let spoken = try await Narration.shared.speak(subtitle)
-      narrationURL = spoken.url
-      let speechAsset = AVURLAsset(url: spoken.url)
-      if let sourceSpeech = try await speechAsset.loadTracks(withMediaType: .audio).first,
-         let compositionSpeech = composition.addMutableTrack(
-          withMediaType: .audio,
-          preferredTrackID: kCMPersistentTrackID_Invalid
-         ) {
-        let speechRange = try await sourceSpeech.load(.timeRange)
-        let usable = CMTimeMinimum(timelineDuration, speechRange.duration)
-        if usable.isValid, usable.seconds > 0.05 {
-          try compositionSpeech.insertTimeRange(
-            CMTimeRange(start: speechRange.start, duration: usable),
-            of: sourceSpeech,
-            at: .zero
-          )
-          speechTrack = compositionSpeech
-          speechDuration = usable.seconds
+      do {
+        let spoken = try await Narration.shared.speak(subtitle)
+        narrationURL = spoken.url
+        let speechAsset = AVURLAsset(url: spoken.url)
+        if let sourceSpeech = try await speechAsset.loadTracks(withMediaType: .audio).first,
+           let compositionSpeech = composition.addMutableTrack(
+            withMediaType: .audio,
+            preferredTrackID: kCMPersistentTrackID_Invalid
+           ) {
+          let speechRange = try await sourceSpeech.load(.timeRange)
+          let usable = CMTimeMinimum(timelineDuration, speechRange.duration)
+          if usable.isValid, usable.seconds > 0.05 {
+            try compositionSpeech.insertTimeRange(
+              CMTimeRange(start: speechRange.start, duration: usable),
+              of: sourceSpeech,
+              at: .zero
+            )
+            speechTrack = compositionSpeech
+            speechDuration = usable.seconds
+          }
         }
-      }
-      if speechTrack == nil {
-        throw NarrationError.failed
+      } catch {
+        narrationURL = nil
+        speechTrack = nil
+        speechDuration = 0
       }
     }
 
@@ -512,6 +539,7 @@ private enum VideoFlipper {
       throw VideoFlipError.exportFailed("翻转已取消")
     }
     let laterPass = !filterName.isEmpty || overlay
+    let spoken = min(speechDuration, max(safeDuration.seconds - 1.0 / 30.0, 0))
     FlipControl.phase(0.05, laterPass ? 0.62 : 0.96)
     do {
       try await exportVideo(
@@ -520,7 +548,7 @@ private enum VideoFlipper {
         audioMix: audioMix(
           original: originalAudioTrack,
           speech: speechTrack,
-          speechDuration: min(speechDuration, max(safeDuration.seconds - 1.0 / 30.0, 0))
+          speechDuration: spoken
         ),
         outputURL: outputURL,
         jobId: jobId
@@ -549,7 +577,7 @@ private enum VideoFlipper {
           source: outputURL,
           options: options,
           subtitle: subtitle,
-          speechDuration: speechDuration,
+          speechDuration: spoken,
           jobId: jobId
         )
       }
@@ -575,7 +603,7 @@ private enum VideoFlipper {
         source: filtered,
         options: options,
         subtitle: subtitle,
-        speechDuration: speechDuration,
+        speechDuration: spoken,
         jobId: jobId
       )
     } catch {
@@ -877,7 +905,7 @@ private enum VideoFlipper {
             lastChange = Date()
           }
           FlipControl.noteExport(Double(fraction), job: jobId)
-          if Date().timeIntervalSince(lastChange) > 20 {
+          if Date().timeIntervalSince(lastChange) > 3 {
             exportSession.cancelExport()
             gate.run {
               timer.cancel()

@@ -24,6 +24,7 @@ import { FaceCoverScreen } from './FaceCoverScreen';
 import { SmearScreen } from './SmearScreen';
 import { WatermarkForm } from './WatermarkForm';
 import { useTheme, type Palette } from './theme';
+import { SignReminder } from './SignReminder';
 import {
   CropNorm,
   ItemStatus,
@@ -550,9 +551,9 @@ export function MediaScreen() {
             lastProgress = value;
             lastMove = Date.now();
           }
-          const stalled = Date.now() - lastMove > 20000;
+          const stalled = Date.now() - lastMove > 3000;
           const used = Math.max(1, Math.floor((Date.now() - startedAt) / 1000));
-          const remain = Math.max(0, Math.ceil((20000 - (Date.now() - lastMove)) / 1000));
+          const remain = Math.max(0, Math.ceil((3000 - (Date.now() - lastMove)) / 1000));
           if (stalled && !stallRef.current.has(item.id) && !cancelledRef.current.has(item.id)) {
             stallRef.current.add(item.id);
             VideoFlip.cancelFlip(item.id);
@@ -564,7 +565,7 @@ export function MediaScreen() {
                 ...it,
                 progress: value,
                 message: stalled
-                  ? '进度已停满 20 秒，正在自动改存原视频…'
+                  ? '进度已停满 3 秒，正在自动改存原视频…'
                   : `正在转换… 本条已用 ${used} 秒，进度停住还剩 ${remain} 秒`,
               };
             }),
@@ -650,19 +651,20 @@ export function MediaScreen() {
               ),
             );
           } else {
-          const currentUri = (videosRef.current.find((it) => it.id === item.id) ?? item).uri;
-          const readable = !item.unreadable && sourceReady(currentUri);
+          const latest = videosRef.current.find((it) => it.id === item.id) ?? item;
+          const currentUri = latest.uri;
+          const readable = !latest.unreadable && sourceReady(currentUri);
           if (!readable) {
             throw new Error('这个文件已经读不到');
           }
           outputUri = await withExport(() =>
             withNative(() =>
               abandonIfStopped(item.id, () =>
-                VideoFlip.flipHorizontal(item.uri, {
+                VideoFlip.flipHorizontal(latest.uri, {
                 jobId: item.id,
-                watermark: watermarkPayload(item.watermark ?? defaultWatermark),
+                watermark: watermarkPayload(latest.watermark ?? defaultWatermark),
                 zoom,
-                subtitle: item.subtitle?.trim() || undefined,
+                subtitle: latest.subtitle?.trim() || undefined,
                 extend:
                   extendVideo && useCurrentClip
                     ? {
@@ -672,8 +674,8 @@ export function MediaScreen() {
                         mode: highlightMode,
                       }
                     : undefined,
-                filter: item.filter,
-                ...(item.cut ? { cut: { start: Number(item.cut.start), end: Number(item.cut.end) } } : {}),
+                filter: latest.filter,
+                ...(latest.cut ? { cut: { start: Number(latest.cut.start), end: Number(latest.cut.end) } } : {}),
                 }),
               ),
             ),
@@ -1072,6 +1074,7 @@ export function MediaScreen() {
 
   return (
     <View style={[styles.screen, { paddingTop: insets.top + 8 }]}>
+      <SignReminder />
       <View style={styles.titleRow}>
         <Text style={styles.title}>{kind === 'video' ? '视频处理' : '图片处理'}</Text>
         {kind === 'video' ? (
@@ -1174,7 +1177,7 @@ export function MediaScreen() {
               ))}
             </View>
             <Text style={styles.optionHint}>
-              字幕、滤镜、水印、移除片段、抽帧和封面都在每条视频下面单独设置。不填写或不勾选的那一条不会做这项处理。有字幕的会用系统中文男声解说，原声在解说期间变小。
+              字幕、滤镜、水印、移除片段、抽帧和封面都在每条视频下面单独设置。不填写或不勾选的那一条不会做这项处理。有字幕的会用系统中文男声解说，字幕从开头跟解说一起出现，解说结束就消失，原声也在这段时间变小。
             </Text>
             <View style={styles.optionRow}>
               <Text style={styles.optionLabel}>延长视频</Text>
@@ -1431,7 +1434,7 @@ export function MediaScreen() {
                           commitVideos((prev) => prev.map((it) => (it.id === item.id ? { ...it, subtitle: text } : it)))
                         }
                         editable={!busy}
-                        placeholder="给这条视频加字幕，留空则不加"
+                        placeholder="给这条视频加字幕，留空则不加。字幕会跟解说同时出现、同时结束"
                         placeholderTextColor={palette.placeholder}
                         multiline
                         style={styles.itemScript}

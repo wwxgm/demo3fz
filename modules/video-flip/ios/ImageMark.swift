@@ -135,58 +135,76 @@ enum WatermarkBurner {
   }
 
   private static func subtitleLayer(text: String, canvas: CGSize, duration: Double, speechDuration: Double) -> CALayer {
+    _ = duration
+    _ = speechDuration
     let fontSize = max(18, min(canvas.height * 0.042, 42))
     let font = UIFont(name: "PingFangSC-Medium", size: fontSize) ?? UIFont.systemFont(ofSize: fontSize, weight: .medium)
     let maxTextWidth = max(40, canvas.width - 48)
+    let paragraph = NSMutableParagraphStyle()
+    paragraph.alignment = .center
+    paragraph.lineBreakMode = .byWordWrapping
+    let attributes: [NSAttributedString.Key: Any] = [
+      .font: font,
+      .foregroundColor: UIColor.white,
+      .paragraphStyle: paragraph,
+    ]
     let bounds = (text as NSString).boundingRect(
       with: CGSize(width: maxTextWidth, height: canvas.height * 0.28),
       options: [.usesLineFragmentOrigin, .usesFontLeading],
-      attributes: [.font: font],
+      attributes: attributes,
       context: nil
     )
     let box = CGSize(width: min(canvas.width - 24, ceil(bounds.width) + 20), height: ceil(bounds.height) + 14)
-    let container = CALayer()
-    container.bounds = CGRect(origin: .zero, size: box)
-    container.anchorPoint = CGPoint(x: 0.5, y: 0.5)
-    container.position = CGPoint(x: canvas.width / 2, y: canvas.height - 16 - box.height / 2)
-    container.backgroundColor = UIColor.black.withAlphaComponent(0.45).cgColor
-    container.cornerRadius = 8
-    container.masksToBounds = true
-
-    let textLayer = CATextLayer()
-    textLayer.frame = container.bounds.insetBy(dx: 8, dy: 6)
-    textLayer.string = text
-    if let cgFont = CGFont(font.fontName as CFString) {
-      textLayer.font = cgFont
+    let format = UIGraphicsImageRendererFormat()
+    format.scale = 2
+    format.opaque = false
+    let image = UIGraphicsImageRenderer(size: box, format: format).image { _ in
+      UIColor.black.withAlphaComponent(0.55).setFill()
+      UIBezierPath(roundedRect: CGRect(origin: .zero, size: box), cornerRadius: 8).fill()
+      let textRect = CGRect(x: 8, y: 6, width: box.width - 16, height: box.height - 12)
+      (text as NSString).draw(
+        with: textRect,
+        options: [.usesLineFragmentOrigin, .usesFontLeading],
+        attributes: attributes,
+        context: nil
+      )
     }
-    textLayer.fontSize = fontSize
-    textLayer.foregroundColor = UIColor.white.cgColor
-    textLayer.alignmentMode = .center
-    textLayer.isWrapped = true
-    textLayer.contentsScale = 2
-    container.addSublayer(textLayer)
-    holdSubtitle(container, videoDuration: duration, speechDuration: speechDuration)
-    return container
+    let layer = CALayer()
+    layer.bounds = CGRect(origin: .zero, size: box)
+    layer.anchorPoint = CGPoint(x: 0.5, y: 0.5)
+    layer.position = CGPoint(x: canvas.width / 2, y: canvas.height - 16 - box.height / 2)
+    layer.contents = image.cgImage
+    layer.contentsScale = 2
+    layer.contentsGravity = .resize
+    layer.isGeometryFlipped = true
+    syncSubtitle(layer, videoDuration: duration, speechDuration: speechDuration)
+    return layer
   }
 
-  private static func holdSubtitle(_ layer: CALayer, videoDuration: Double, speechDuration: Double) {
+  /// 字幕只覆盖解说的那一段。解说和画面一样长时整段都显示。
+  private static func syncSubtitle(_ layer: CALayer, videoDuration: Double, speechDuration: Double) {
     let video = max(videoDuration, 0.2)
-    let speech = min(max(speechDuration, 0.2), video)
-    if video - speech < 0.2 {
+    let speech = speechDuration.isFinite ? speechDuration : 0
+    if speech <= 0.05 || video - speech < 0.12 {
       layer.opacity = 1
       return
     }
     let end = min(max(speech / video, 0.02), 0.97)
-    let hide = min(end + 0.02, 1)
+    let hide = min(end + min(0.04 / video, 0.02), 0.995)
     let animation = CAKeyframeAnimation(keyPath: "opacity")
-    animation.values = [1, 1, 0]
-    animation.keyTimes = [0, NSNumber(value: end), NSNumber(value: hide)]
+    animation.values = [1, 1, 0, 0]
+    animation.keyTimes = [
+      0,
+      NSNumber(value: end),
+      NSNumber(value: hide),
+      1,
+    ]
     animation.duration = video
     animation.beginTime = AVCoreAnimationBeginTimeAtZero
     animation.isRemovedOnCompletion = false
-    animation.fillMode = .forwards
-    layer.opacity = 0
-    layer.add(animation, forKey: "subtitle-hold")
+    animation.fillMode = .both
+    layer.opacity = 1
+    layer.add(animation, forKey: "subtitle-sync")
   }
 
   private static func textLayer(

@@ -79,6 +79,7 @@ type VideoFlipNative = {
   loadPage(url: string, referer: string): Promise<string>;
   stageOriginal(uri: string): Promise<string>;
   sourceReady(uri: string): boolean;
+  installDaysLeft(): number;
   prepareFlipBatch(): void;
   flipProgress(id: string): number;
   cancelFlip(id: string): void;
@@ -125,6 +126,9 @@ const missing: VideoFlipNative = {
   },
   sourceReady() {
     return false;
+  },
+  installDaysLeft() {
+    return -999;
   },
   prepareFlipBatch() {},
   flipProgress() {
