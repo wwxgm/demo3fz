@@ -70,7 +70,7 @@ private enum NarrationEngine {
     var pitch: Float
   }
 
-  static func speechStyle(_ id: String) -> SpeechStyle {
+  private static func speechStyle(_ id: String) -> SpeechStyle {
     let normal = AVSpeechUtteranceDefaultSpeechRate
     switch id {
     case "fast":
