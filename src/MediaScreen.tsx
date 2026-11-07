@@ -551,9 +551,9 @@ export function MediaScreen() {
             lastProgress = value;
             lastMove = Date.now();
           }
-          const stalled = Date.now() - lastMove > 3000;
+          const stalled = Date.now() - lastMove >= 1000;
           const used = Math.max(1, Math.floor((Date.now() - startedAt) / 1000));
-          const remain = Math.max(0, Math.ceil((3000 - (Date.now() - lastMove)) / 1000));
+          const remain = Math.max(0, Math.ceil((1000 - (Date.now() - lastMove)) / 1000));
           if (stalled && !stallRef.current.has(item.id) && !cancelledRef.current.has(item.id)) {
             stallRef.current.add(item.id);
             VideoFlip.cancelFlip(item.id);
@@ -565,7 +565,7 @@ export function MediaScreen() {
                 ...it,
                 progress: value,
                 message: stalled
-                  ? '进度已停满 3 秒，正在自动改存原视频…'
+                  ? '进度已停满 1 秒，正在自动改存原视频…'
                   : `正在转换… 本条已用 ${used} 秒，进度停住还剩 ${remain} 秒`,
               };
             }),
@@ -1177,7 +1177,7 @@ export function MediaScreen() {
               ))}
             </View>
             <Text style={styles.optionHint}>
-              字幕、滤镜、水印、移除片段、抽帧和封面都在每条视频下面单独设置。不填写或不勾选的那一条不会做这项处理。有字幕的会用系统中文男声解说，字幕从开头跟解说一起出现，解说结束就消失，原声也在这段时间变小。
+              字幕、滤镜、水印、移除片段、抽帧和封面都在每条视频下面单独设置。不填写或不勾选的那一条不会做这项处理。有字幕的会用系统中文男声解说，字幕从开头跟解说一起出现，解说结束就消失。这段时间原声变小，字幕没了以后原声再慢慢加大。
             </Text>
             <View style={styles.optionRow}>
               <Text style={styles.optionLabel}>延长视频</Text>

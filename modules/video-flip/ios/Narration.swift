@@ -13,7 +13,7 @@ actor Narration {
   private var busy = false
   private var waiters: [CheckedContinuation<Void, Never>] = []
 
-  func speak(_ text: String) async throws -> (url: URL, duration: Double) {
+  func speak(_ text: String, style: String = "steady") async throws -> (url: URL, duration: Double) {
     if busy {
       await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
         waiters.append(continuation)
@@ -21,7 +21,7 @@ actor Narration {
     }
     busy = true
     do {
-      let spoken = try await NarrationEngine.speak(text)
+      let spoken = try await NarrationEngine.speak(text, style: style)
       release()
       return spoken
     } catch {
@@ -40,18 +40,19 @@ actor Narration {
 }
 
 private enum NarrationEngine {
-  static func speak(_ text: String) async throws -> (url: URL, duration: Double) {
+  static func speak(_ text: String, style: String) async throws -> (url: URL, duration: Double) {
     let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
     guard !trimmed.isEmpty else {
       throw NarrationError.failed
     }
-    guard let voice = chineseMaleVoice() else {
+    let chosen = speechStyle(style)
+    guard let voice = chineseVoice(gender: chosen.gender) else {
       throw NarrationError.failed
     }
     let utterance = AVSpeechUtterance(string: trimmed)
     utterance.voice = voice
-    utterance.rate = AVSpeechUtteranceDefaultSpeechRate
-    utterance.pitchMultiplier = 0.92
+    utterance.rate = chosen.rate
+    utterance.pitchMultiplier = chosen.pitch
     let output = FileManager.default.temporaryDirectory
       .appendingPathComponent("narration-\(UUID().uuidString).caf")
     return try await withCheckedThrowingContinuation { continuation in
@@ -63,10 +64,42 @@ private enum NarrationEngine {
     }
   }
 
-  static func chineseMaleVoice() -> AVSpeechSynthesisVoice? {
-    let voices = AVSpeechSynthesisVoice.speechVoices().filter { $0.language.hasPrefix("zh") }
-    return voices.first { $0.gender == .male && $0.quality == .enhanced }
-      ?? voices.first { $0.gender == .male }
+  private struct SpeechStyle {
+    var gender: AVSpeechSynthesisVoiceGender
+    var rate: Float
+    var pitch: Float
+  }
+
+  static func speechStyle(_ id: String) -> SpeechStyle {
+    let normal = AVSpeechUtteranceDefaultSpeechRate
+    switch id {
+    case "fast":
+      return SpeechStyle(gender: .male, rate: min(normal * 1.22, AVSpeechUtteranceMaximumSpeechRate), pitch: 1.02)
+    case "low":
+      return SpeechStyle(gender: .male, rate: max(normal * 0.86, AVSpeechUtteranceMinimumSpeechRate), pitch: 0.78)
+    case "female":
+      return SpeechStyle(gender: .female, rate: normal, pitch: 1.06)
+    case "lively":
+      return SpeechStyle(gender: .female, rate: min(normal * 1.16, AVSpeechUtteranceMaximumSpeechRate), pitch: 1.16)
+    default:
+      return SpeechStyle(gender: .male, rate: normal, pitch: 0.92)
+    }
+  }
+
+  static func chineseVoice(gender: AVSpeechSynthesisVoiceGender) -> AVSpeechSynthesisVoice? {
+    let voices = AVSpeechSynthesisVoice.speechVoices().filter { voice in
+      voice.language.hasPrefix("zh-CN") || voice.language.hasPrefix("zh-Hans")
+    }
+    let pool = voices.isEmpty
+      ? AVSpeechSynthesisVoice.speechVoices().filter { $0.language.hasPrefix("zh") }
+      : voices
+    if #available(iOS 16.0, *) {
+      if let voice = pool.first(where: { $0.gender == gender && $0.quality == .premium }) {
+        return voice
+      }
+    }
+    return pool.first { $0.gender == gender && $0.quality == .enhanced }
+      ?? pool.first { $0.gender == gender }
       ?? AVSpeechSynthesisVoice(language: "zh-CN")
   }
 }
@@ -148,11 +181,13 @@ private final class NarrationWriter: NSObject {
 
   private func timeout() {
     lock.lock()
-    defer { lock.unlock() }
-    guard !finished else {
-      return
-    }
+    let already = finished
+    lock.unlock()
+    if already { return }
     synth.stopSpeaking(at: .immediate)
+    lock.lock()
+    defer { lock.unlock() }
+    guard !finished else { return }
     failLocked(NarrationError.failed)
   }
 

@@ -1,10 +1,23 @@
 import { useState } from 'react';
-import { ActivityIndicator, Alert, Linking, Pressable, ScrollView, StyleSheet, Text, View } from 'react-native';
+import {
+  ActivityIndicator,
+  Alert,
+  Linking,
+  Platform,
+  Pressable,
+  ScrollView,
+  Settings,
+  StyleSheet,
+  Text,
+  TextInput,
+  View,
+} from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
+import { AlbumShareScreen } from './AlbumShareScreen';
 import VideoFlip from '../modules/video-flip';
 import { themeColors, useTheme, type Appearance } from './theme';
 
-type Page = 'menu' | 'music' | 'footage' | 'look';
+type Page = 'menu' | 'music' | 'footage' | 'look' | 'urls' | 'library';
 
 type Material = {
   title: string;
@@ -79,12 +92,91 @@ const FOOTAGE: Material[] = [
   },
 ];
 
+const URL_KEY = 'batchUrls';
+
+function storageGet() {
+  try {
+    if (Platform.OS === 'web' && typeof localStorage !== 'undefined') {
+      return localStorage.getItem(URL_KEY) ?? '';
+    }
+    const raw = Settings.get(URL_KEY);
+    return typeof raw === 'string' ? raw : '';
+  } catch {
+    return '';
+  }
+}
+
+function storageSet(value: string) {
+  if (Platform.OS === 'web' && typeof localStorage !== 'undefined') {
+    localStorage.setItem(URL_KEY, value);
+    return;
+  }
+  Settings.set({ [URL_KEY]: value });
+}
+
+function readUrls() {
+  try {
+    const raw = storageGet();
+    if (!raw) return [];
+    const parsed = JSON.parse(raw) as unknown;
+    if (!Array.isArray(parsed)) return [];
+    return parsed.filter((item): item is string => typeof item === 'string' && item.length > 0).slice(0, 200);
+  } catch {
+    return [];
+  }
+}
+
+function writeUrls(urls: string[]) {
+  storageSet(JSON.stringify(urls));
+}
+
+function tidyUrl(raw: string) {
+  return raw.trim().replace(/^[<【（("']+/, '').replace(/[>】）)"'，。；;、,]+$/g, '');
+}
+
+function normalizeUrl(raw: string) {
+  let text = tidyUrl(raw);
+  if (!text || /\s/.test(text)) return null;
+  if (!/^https?:\/\//i.test(text)) {
+    if (/^www\./i.test(text) || /^[a-z0-9.-]+\.[a-z]{2,}([/?#]|$)/i.test(text)) {
+      text = `https://${text}`;
+    } else {
+      return null;
+    }
+  }
+  try {
+    const url = new URL(text);
+    if (url.protocol !== 'http:' && url.protocol !== 'https:') return null;
+    if (!url.hostname.includes('.')) return null;
+    return url.toString();
+  } catch {
+    return null;
+  }
+}
+
+function extractUrls(text: string) {
+  const found: string[] = [];
+  const withScheme = text.match(/https?:\/\/[^\s<>"']+/gi) ?? [];
+  for (const item of withScheme) {
+    const url = normalizeUrl(item);
+    if (url) found.push(url);
+  }
+  for (const line of text.split(/\s+/)) {
+    if (/https?:\/\//i.test(line)) continue;
+    const url = normalizeUrl(line);
+    if (url) found.push(url);
+  }
+  return [...new Set(found)];
+}
+
 export function SettingsScreen() {
   const insets = useSafeAreaInsets();
   const { color, setColor, appearance, setAppearance, palette } = useTheme();
   const [clearing, setClearing] = useState(false);
   const [page, setPage] = useState<Page>('menu');
   const [opened, setOpened] = useState<Material | null>(null);
+  const [urls, setUrls] = useState<string[]>(() => readUrls());
+  const [draft, setDraft] = useState('');
 
   const clearCache = () => {
     if (clearing) return;
@@ -103,8 +195,67 @@ export function SettingsScreen() {
 
   const openLink = (url: string) => {
     void Linking.openURL(url).catch(() => {
-      Alert.alert('无法打开', '这个素材页面没有打开，可以稍后再试。');
+      Alert.alert('无法打开', '这个页面没有打开，可以稍后再试。');
     });
+  };
+
+  const importUrls = () => {
+    const incoming = extractUrls(draft);
+    if (incoming.length === 0) {
+      Alert.alert('没有网址', '没有识别到网址。一行一条，或以 http://、https:// 开头。');
+      return;
+    }
+    const existed = new Set(urls);
+    const room = 200 - urls.length;
+    if (room <= 0) {
+      Alert.alert('已经很多了', '最多保存 200 条。可以先清空再导入。');
+      return;
+    }
+    const fresh = incoming.filter((item) => !existed.has(item));
+    const added = fresh.slice(0, room);
+    const skipped = incoming.length - fresh.length;
+    const overflow = fresh.length - added.length;
+    if (added.length === 0) {
+      Alert.alert('都已保存', '这些网址之前已经在列表里。');
+      return;
+    }
+    const next = [...urls, ...added];
+    try {
+      writeUrls(next);
+    } catch {
+      Alert.alert('没有保存', '这次没能写进手机，请再试一次。');
+      return;
+    }
+    setUrls(next);
+    setDraft('');
+    const extra = [
+      skipped > 0 ? `${skipped} 条已经在列表里` : '',
+      overflow > 0 ? `超出 200 条的没有加入` : '',
+    ].filter(Boolean);
+    Alert.alert('已保存', extra.length > 0 ? `新增 ${added.length} 条，${extra.join('，')}。下次打开还能看到。` : `新增 ${added.length} 条。下次打开还能看到。`);
+  };
+
+  const clearUrls = () => {
+    if (urls.length === 0) {
+      Alert.alert('没有网址', '当前没有已保存的网址。');
+      return;
+    }
+    Alert.alert('清空网址', `要删掉已保存的 ${urls.length} 条网址吗？`, [
+      { text: '取消', style: 'cancel' },
+      {
+        text: '清空',
+        style: 'destructive',
+        onPress: () => {
+          try {
+            writeUrls([]);
+          } catch {
+            Alert.alert('没有清空', '这次没能改掉已保存的网址，请再试一次。');
+            return;
+          }
+          setUrls([]);
+        },
+      },
+    ]);
   };
 
   if (opened) {
@@ -173,7 +324,7 @@ export function SettingsScreen() {
     return (
       <View style={[styles.screen, { paddingTop: insets.top + 8 }]}>
         <Text style={[styles.title, { color: palette.text }]}>设置</Text>
-        <Text style={[styles.subtitle, { color: palette.muted }]}>点进去查看素材，或调整外观。</Text>
+        <Text style={[styles.subtitle, { color: palette.muted }]}>点进去查看素材、网址、相册，或调整外观。</Text>
         <ScrollView contentContainerStyle={styles.list}>
           <Pressable
             style={[styles.row, { backgroundColor: palette.card, borderColor: palette.line }]}
@@ -197,6 +348,28 @@ export function SettingsScreen() {
           </Pressable>
           <Pressable
             style={[styles.row, { backgroundColor: palette.card, borderColor: palette.line }]}
+            onPress={() => setPage('urls')}
+          >
+            <View style={styles.rowBody}>
+              <Text style={[styles.rowTitle, { color: palette.text }]}>查看网址</Text>
+              <Text style={[styles.rowHint, { color: palette.muted }]}>
+                {urls.length > 0 ? `已保存 ${urls.length} 条，点开用 Safari 打开` : '批量粘贴网址，点开用 Safari 打开'}
+              </Text>
+            </View>
+            <Text style={[styles.chevron, { color }]}>进入</Text>
+          </Pressable>
+          <Pressable
+            style={[styles.row, { backgroundColor: palette.card, borderColor: palette.line }]}
+            onPress={() => setPage('library')}
+          >
+            <View style={styles.rowBody}>
+              <Text style={[styles.rowTitle, { color: palette.text }]}>相册分享</Text>
+              <Text style={[styles.rowHint, { color: palette.muted }]}>读取相册，滑动多选后分享到夸克</Text>
+            </View>
+            <Text style={[styles.chevron, { color }]}>进入</Text>
+          </Pressable>
+          <Pressable
+            style={[styles.row, { backgroundColor: palette.card, borderColor: palette.line }]}
             onPress={() => setPage('look')}
           >
             <View style={styles.rowBody}>
@@ -205,6 +378,68 @@ export function SettingsScreen() {
             </View>
             <Text style={[styles.chevron, { color }]}>进入</Text>
           </Pressable>
+        </ScrollView>
+      </View>
+    );
+  }
+
+  if (page === 'library') {
+    return <AlbumShareScreen onBack={() => setPage('menu')} />;
+  }
+
+  if (page === 'urls') {
+    return (
+      <View style={[styles.screen, { paddingTop: insets.top + 8 }]}>
+        <Pressable onPress={() => setPage('menu')} hitSlop={8}>
+          <Text style={[styles.back, { color }]}>返回</Text>
+        </Pressable>
+        <Text style={[styles.title, { color: palette.text }]}>查看网址</Text>
+        <Text style={[styles.subtitle, { color: palette.muted }]}>
+          一次粘贴很多条，一行一条。点一条会离开应用，用 Safari 打开。清空前会一直留着，下次打开还能看到。
+        </Text>
+        <ScrollView contentContainerStyle={styles.list} keyboardShouldPersistTaps="handled">
+          <View style={[styles.row, { backgroundColor: palette.card, borderColor: palette.line }]}>
+            <View style={styles.themeBlock}>
+              <Text style={[styles.rowTitle, { color: palette.text }]}>批量导入</Text>
+              <TextInput
+                value={draft}
+                onChangeText={setDraft}
+                multiline
+                placeholder={'https://example.com/a\nhttps://example.com/b'}
+                placeholderTextColor={palette.placeholder}
+                autoCapitalize="none"
+                autoCorrect={false}
+                style={[styles.paste, { backgroundColor: palette.field, color: palette.text }]}
+              />
+              <View style={styles.modes}>
+                <Pressable style={[styles.mode, { backgroundColor: color }]} onPress={importUrls}>
+                  <Text style={[styles.modeText, { color: '#FFFFFF' }]}>导入</Text>
+                </Pressable>
+                <Pressable style={[styles.mode, { backgroundColor: palette.field }]} onPress={clearUrls}>
+                  <Text style={[styles.modeText, { color: palette.text }]}>清空</Text>
+                </Pressable>
+              </View>
+            </View>
+          </View>
+          {urls.length === 0 ? (
+            <View style={[styles.row, { backgroundColor: palette.card, borderColor: palette.line }]}>
+              <Text style={[styles.detail, { color: palette.muted }]}>还没有网址。</Text>
+            </View>
+          ) : (
+            urls.map((item, index) => (
+              <Pressable
+                key={`${item}-${index}`}
+                style={[styles.row, { backgroundColor: palette.card, borderColor: palette.line, alignItems: 'flex-start' }]}
+                onPress={() => openLink(item)}
+              >
+                <View style={styles.rowBody}>
+                  <Text style={[styles.rowTitle, { color: palette.text }]}>{index + 1}</Text>
+                  <Text style={[styles.urlText, { color: palette.muted }]}>{item}</Text>
+                </View>
+                <Text style={[styles.chevron, { color }]}>打开</Text>
+              </Pressable>
+            ))
+          )}
         </ScrollView>
       </View>
     );
@@ -383,5 +618,18 @@ const styles = StyleSheet.create({
   swatchName: {
     color: '#9BB0C5',
     fontSize: 12,
+  },
+  paste: {
+    minHeight: 108,
+    borderRadius: 10,
+    paddingHorizontal: 12,
+    paddingVertical: 10,
+    fontSize: 14,
+    lineHeight: 20,
+    textAlignVertical: 'top',
+  },
+  urlText: {
+    fontSize: 13,
+    lineHeight: 18,
   },
 });

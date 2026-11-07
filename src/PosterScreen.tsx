@@ -20,6 +20,14 @@ import VideoFlip from '../modules/video-flip';
 import { errorText } from './runtime';
 import { useTheme, type Palette } from './theme';
 
+const VOICES = [
+  { id: 'steady', label: '稳重男声' },
+  { id: 'fast', label: '快口男声' },
+  { id: 'low', label: '低沉旁白' },
+  { id: 'female', label: '清晰女声' },
+  { id: 'lively', label: '活泼女声' },
+] as const;
+
 const SAMPLE_SCRIPT = `全网汉堡前五排行榜！看看有没有你的本命🍔
 第5名 华莱士｜汉堡界性价比卷王！十几块直接吃到撑，香辣鸡腿堡经典，学生党夜宵首选，缺点品控看运气
 第4名 肯德基香辣鸡腿堡｜炸鸡底子是真稳，肉嫩入味，沙拉酱调得很舒服，几十年不出错，闭眼冲不踩雷
@@ -64,6 +72,7 @@ export function PosterScreen() {
   const styles = useMemo(() => createPosterStyles(palette), [palette]);
   const [script, setScript] = useState(SAMPLE_SCRIPT);
   const [backgrounds, setBackgrounds] = useState<PosterBackground[]>([]);
+  const [voice, setVoice] = useState<(typeof VOICES)[number]['id']>('steady');
   const [fillBackground, setFillBackground] = useState(true);
   const [removeMusic, setRemoveMusic] = useState(true);
   const [busy, setBusy] = useState(false);
@@ -166,6 +175,7 @@ export function PosterScreen() {
       output = await VideoFlip.makePoster(text, onlyVideo, {
         fill: fillBackground,
         mute: removeMusic,
+        voice,
         backgrounds:
           backgrounds.length > 1 || backgrounds.some((item) => item.kind === 'image')
             ? backgrounds.map((item) => ({ uri: item.uri, kind: item.kind }))
@@ -184,7 +194,7 @@ export function PosterScreen() {
   return (
     <View style={[styles.screen, { paddingTop: insets.top + 8 }]}>
       <Text style={styles.title}>大字报</Text>
-      <Text style={styles.subtitle}>一句一句切换。排行榜写成「第5名 名字｜一句介绍」，名次换的时候介绍也逐句出现。</Text>
+      <Text style={styles.subtitle}>一句一句换到画面中间，并用所选风格读出来。排行榜写成「第5名 名字｜一句介绍」。</Text>
       <ScrollView style={styles.list} contentContainerStyle={styles.listContent} keyboardShouldPersistTaps="handled">
         <TextInput
           value={script}
@@ -195,7 +205,23 @@ export function PosterScreen() {
           editable={!busy}
           style={styles.script}
         />
-        <Text style={styles.hint}>不会把整段排成很多行。一句显示在画面中间，播完再换成下一句。</Text>
+        <Text style={styles.hint}>不会把整段排成很多行。一句显示在画面中间，读完再换成下一句，不会叠在一起。</Text>
+        <Text style={styles.optionLabel}>解说风格</Text>
+        <View style={styles.voiceRow}>
+          {VOICES.map((item) => {
+            const selected = voice === item.id;
+            return (
+              <Pressable
+                key={item.id}
+                disabled={busy}
+                style={[styles.voiceChip, selected && { backgroundColor: color }]}
+                onPress={() => setVoice(item.id)}
+              >
+                <Text style={[styles.voiceText, selected && styles.voiceTextOn]}>{item.label}</Text>
+              </Pressable>
+            );
+          })}
+        </View>
         <View style={styles.optionRow}>
           <Text style={styles.optionLabel}>背景铺满文案</Text>
           <Switch
@@ -206,7 +232,7 @@ export function PosterScreen() {
           />
         </View>
         <Text style={styles.hint}>
-          只有一段背景视频时，打开后会放慢、重复并慢慢放大，直到和文案一样长；关掉则按原速，文案会被截断。多张图片会慢慢放大再还原，并和前后背景渐变切换。视频不够长会自动延长。
+          只有一段背景视频时，打开后会放慢、重复并慢慢放大，直到和解说一样长；关掉则按原速，后面的句子会被截断。多张图片会慢慢放大再还原，并和前后背景渐变切换。视频不够长会自动延长。
         </Text>
         <View style={styles.optionRow}>
           <Text style={styles.optionLabel}>移除背景音乐</Text>
@@ -217,7 +243,7 @@ export function PosterScreen() {
             trackColor={{ false: palette.switchOff, true: color }}
           />
         </View>
-        <Text style={styles.hint}>默认去掉背景里的声音。关掉后保留原背景音乐。</Text>
+        <Text style={styles.hint}>默认去掉背景里的声音。解说仍会读文案。关掉后，背景原声会压低，解说保持清楚。</Text>
         <View style={styles.actions}>
           <Pressable style={styles.secondary} disabled={busy} onPress={() => void pickLibrary()}>
             <Text style={styles.secondaryText}>相册背景</Text>
@@ -330,6 +356,27 @@ function createPosterStyles(palette: Palette) {
     color: palette.text,
     fontSize: 15,
     fontWeight: '600',
+  },
+  voiceRow: {
+    flexDirection: 'row',
+    flexWrap: 'wrap',
+    gap: 8,
+  },
+  voiceChip: {
+    minHeight: 34,
+    paddingHorizontal: 12,
+    borderRadius: 9,
+    alignItems: 'center',
+    justifyContent: 'center',
+    backgroundColor: palette.field,
+  },
+  voiceText: {
+    color: palette.text,
+    fontSize: 14,
+    fontWeight: '700',
+  },
+  voiceTextOn: {
+    color: '#FFFFFF',
   },
   remove: {
     color: '#F0A8A8',

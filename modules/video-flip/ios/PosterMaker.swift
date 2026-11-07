@@ -37,16 +37,17 @@ enum PosterMaker {
     let trimmedBackground = backgroundUri.trimmingCharacters(in: .whitespacesAndNewlines)
     let fill = Self.flag(options, key: "fill", default: true)
     let mute = Self.flag(options, key: "mute", default: true)
-    let wantedSeconds = Self.scriptSeconds(
-      ranked: ranked,
-      rankCount: cards.filter { $0.rank }.count,
-      lineCount: rows.count
-    )
+    let voice = (options["voice"] as? String) ?? "steady"
+    let spoken = try await prepareBeats(cards: cards, ranked: ranked, rows: rows, voice: voice)
+    defer {
+      for url in spoken.temps {
+        try? FileManager.default.removeItem(at: url)
+      }
+    }
+    let wantedSeconds = spoken.duration
     if let clips = Self.clipList(options: options), !clips.isEmpty {
       return try await makeSequence(
-        cards: cards,
-        ranked: ranked,
-        rows: rows,
+        beats: spoken.beats,
         clips: clips,
         mute: mute,
         wantedSeconds: wantedSeconds
@@ -182,14 +183,16 @@ enum PosterMaker {
     videoComposition.instructions = [instruction]
     videoComposition.renderSize = renderSize
     videoComposition.frameDuration = CMTime(value: 1, timescale: 30)
-    if ranked {
-      burnRanking(cards, into: videoComposition, renderSize: renderSize, duration: aligned.seconds)
-    } else {
-      burn(rows, into: videoComposition, renderSize: renderSize, duration: aligned.seconds)
-    }
+    let mix = try await attachSpeech(
+      beats: spoken.beats,
+      composition: composition,
+      background: compositionAudio,
+      limit: aligned
+    )
+    burnBeats(spoken.beats, into: videoComposition, renderSize: renderSize, duration: aligned.seconds)
 
     let output = FileManager.default.temporaryDirectory.appendingPathComponent("poster-\(UUID().uuidString).mp4")
-    try await export(composition: composition, videoComposition: videoComposition, output: output)
+    try await export(composition: composition, videoComposition: videoComposition, output: output, audioMix: mix)
     return output.absoluteString
   }
 
@@ -218,9 +221,7 @@ enum PosterMaker {
   }
 
   private static func makeSequence(
-    cards: [Card],
-    ranked: Bool,
-    rows: [String],
+    beats: [Beat],
     clips: [Clip],
     mute: Bool,
     wantedSeconds: Double
@@ -349,13 +350,15 @@ enum PosterMaker {
     videoComposition.instructions = [instruction]
     videoComposition.renderSize = canvas
     videoComposition.frameDuration = CMTime(value: 1, timescale: 30)
-    if ranked {
-      burnRanking(cards, into: videoComposition, renderSize: canvas, duration: aligned.seconds)
-    } else {
-      burn(rows, into: videoComposition, renderSize: canvas, duration: aligned.seconds)
-    }
+    let mix = try await attachSpeech(
+      beats: beats,
+      composition: composition,
+      background: compositionAudio,
+      limit: aligned
+    )
+    burnBeats(beats, into: videoComposition, renderSize: canvas, duration: aligned.seconds)
     let output = FileManager.default.temporaryDirectory.appendingPathComponent("poster-\(UUID().uuidString).mp4")
-    try await export(composition: composition, videoComposition: videoComposition, output: output)
+    try await export(composition: composition, videoComposition: videoComposition, output: output, audioMix: mix)
     return output.absoluteString
   }
 
@@ -630,8 +633,132 @@ enum PosterMaker {
     return cards
   }
 
-  private static func burnRanking(
-    _ cards: [Card],
+  private struct Beat {
+    var text: String
+    var rankTitle: Bool
+    var start: Double
+    var end: Double
+    var audio: URL?
+  }
+
+  private static func prepareBeats(cards: [Card], ranked: Bool, rows: [String], voice: String) async throws -> (beats: [Beat], duration: Double, temps: [URL]) {
+    var texts: [(String, Bool)] = []
+    if ranked {
+      for card in cards {
+        if card.rank {
+          let head = card.headline.trimmingCharacters(in: .whitespacesAndNewlines)
+          if !head.isEmpty {
+            texts.append((head, true))
+          }
+          for line in sentences(card.body) {
+            texts.append((line, false))
+          }
+        } else {
+          let source = [card.headline, card.body].filter { !$0.isEmpty }.joined()
+          for line in sentences(source) {
+            texts.append((line, false))
+          }
+        }
+      }
+    } else {
+      for row in rows {
+        let line = row.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !line.isEmpty {
+          texts.append((line, false))
+        }
+      }
+    }
+    guard !texts.isEmpty else {
+      throw PosterError.message("请先输入文案")
+    }
+    if texts.count > 60 {
+      throw PosterError.message("文案太长，请分成 60 句以内再制作")
+    }
+
+    var temps: [URL] = []
+    var beats: [Beat] = []
+    var cursor = 0.25
+    do {
+      for item in texts {
+        let spoken = try await Narration.shared.speak(voiceLine(item.0), style: voice)
+        temps.append(spoken.url)
+        let length = max(spoken.duration, 0.55)
+        let start = cursor
+        let end = start + length
+        beats.append(Beat(text: item.0, rankTitle: item.1, start: start, end: end, audio: spoken.url))
+        cursor = end + 0.16
+      }
+    } catch {
+      for url in temps {
+        try? FileManager.default.removeItem(at: url)
+      }
+      throw PosterError.message("无法生成解说。请到「设置 > 辅助功能 > 朗读内容 > 语音」下载中文语音后再试")
+    }
+    return (beats, max(cursor + 0.35, 1.2), temps)
+  }
+
+  private static func voiceLine(_ text: String) -> String {
+    let cleaned = text.unicodeScalars.filter { scalar in
+      !(scalar.properties.isEmoji && scalar.value > 0x238C)
+    }
+    let spoken = String(String.UnicodeScalarView(cleaned)).trimmingCharacters(in: .whitespacesAndNewlines)
+    return spoken.isEmpty ? text : spoken
+  }
+
+  private static func attachSpeech(
+    beats: [Beat],
+    composition: AVMutableComposition,
+    background: AVMutableCompositionTrack?,
+    limit: CMTime
+  ) async throws -> AVMutableAudioMix {
+    guard let speech = composition.addMutableTrack(
+      withMediaType: .audio,
+      preferredTrackID: kCMPersistentTrackID_Invalid
+    ) else {
+      throw PosterError.message("无法加入解说")
+    }
+    var inserted = false
+    for beat in beats {
+      guard let url = beat.audio, beat.start.isFinite, beat.end.isFinite, beat.end > beat.start else { continue }
+      let asset = AVURLAsset(url: url)
+      guard let track = try await asset.loadTracks(withMediaType: .audio).first else { continue }
+      let range = try await track.load(.timeRange)
+      guard range.duration.isValid, range.duration.seconds > 0.02 else { continue }
+      let slot = CMTime(seconds: beat.end - beat.start, preferredTimescale: 600)
+      let use = CMTimeMinimum(range.duration, slot)
+      guard use.isValid, use.seconds > 0.02 else { continue }
+      let at = CMTime(seconds: beat.start, preferredTimescale: 600)
+      try speech.insertTimeRange(CMTimeRange(start: range.start, duration: use), of: track, at: at)
+      inserted = true
+    }
+    guard inserted else {
+      composition.removeTrack(speech)
+      throw PosterError.message("无法生成解说。请到「设置 > 辅助功能 > 朗读内容 > 语音」下载中文语音后再试")
+    }
+    let spokenRange = try await speech.load(.timeRange)
+    let spokenEnd = CMTimeAdd(spokenRange.start, spokenRange.duration)
+    if CMTimeCompare(spokenEnd, limit) > 0 {
+      let start = CMTimeMaximum(limit, spokenRange.start)
+      if CMTimeCompare(spokenEnd, start) > 0 {
+        speech.removeTimeRange(CMTimeRange(start: start, duration: CMTimeSubtract(spokenEnd, start)))
+      }
+    }
+    let mix = AVMutableAudioMix()
+    var parameters: [AVMutableAudioMixInputParameters] = []
+    if let background {
+      let input = AVMutableAudioMixInputParameters(track: background)
+      input.setVolume(0.22, at: .zero)
+      parameters.append(input)
+    }
+    let voice = AVMutableAudioMixInputParameters(track: speech)
+    voice.setVolume(1, at: .zero)
+    parameters.append(voice)
+    mix.inputParameters = parameters
+    return mix
+  }
+
+  private static func burnBeats(
+    _ beats: [Beat],
     into composition: AVMutableVideoComposition,
     renderSize: CGSize,
     duration: Double
@@ -644,53 +771,62 @@ enum PosterMaker {
     parent.isGeometryFlipped = true
     parent.addSublayer(videoLayer)
 
-    let ranks = cards.filter { $0.rank }
-    let title = cards.first(where: { !$0.rank })?.headline ?? ""
-    let titleLines = sentences(title)
-    let rawLead = titleLines.isEmpty ? 0.35 : Double(titleLines.count) * 1.15
-    let lead = min(rawLead, max(duration * 0.28, 0))
-    if !titleLines.isEmpty, lead > 0.05 {
-      let each = lead / Double(titleLines.count)
-      for (index, line) in titleLines.enumerated() {
-        let start = Double(index) * each
-        let end = index == titleLines.count - 1 ? lead : start + each
-        let fitted = fitSentence(line, canvas: renderSize)
-        let layer = textLayer(styled(line, font: fitted.font), size: fitted.size)
-        layer.position = CGPoint(x: renderSize.width / 2, y: renderSize.height * 0.16)
-        hold(layer, start: start, end: end, videoDuration: max(duration, end))
-        spinIn(layer, delay: start)
-        parent.addSublayer(layer)
-      }
-    }
-
-    let rankSpan = max(duration - lead, 0)
-    let each = rankSpan / Double(max(ranks.count, 1))
-    for (index, card) in ranks.enumerated() {
-      let start = lead + Double(index) * each
-      let end = index == ranks.count - 1 ? duration : start + each
-      guard end > start + 0.04 else { continue }
-      let head = fitSentence(card.headline, canvas: renderSize)
-      let headLayer = textLayer(rankHeadline(card.headline, font: head.font), size: head.size)
-      headLayer.position = CGPoint(x: renderSize.width / 2, y: renderSize.height * 0.4)
-      hold(headLayer, start: start, end: end, videoDuration: max(duration, end))
-      spinIn(headLayer, delay: start)
-      parent.addSublayer(headLayer)
-      let phrases = sentences(card.body)
-      let slice = (end - start) / Double(max(phrases.count, 1))
-      for (offset, phrase) in phrases.enumerated() {
-        let phraseStart = start + Double(offset) * slice
-        let phraseEnd = offset == phrases.count - 1 ? end : phraseStart + slice
-        guard phraseEnd > phraseStart + 0.04 else { continue }
-        let fitted = fitSentence(phrase, canvas: renderSize)
-        let bodyLayer = textLayer(styled(phrase, font: fitted.font), size: fitted.size)
-        bodyLayer.position = CGPoint(x: renderSize.width / 2, y: renderSize.height * 0.58)
-        hold(bodyLayer, start: phraseStart, end: phraseEnd, videoDuration: max(duration, phraseEnd))
-        spinIn(bodyLayer, delay: phraseStart)
-        parent.addSublayer(bodyLayer)
-      }
+    for beat in beats where beat.start < duration - 0.08 && beat.end > beat.start + 0.04 {
+      let end = min(beat.end, duration)
+      let fitted = fitSentence(beat.text, canvas: renderSize)
+      let drawn = beat.rankTitle
+        ? rankHeadline(beat.text, font: fitted.font)
+        : styled(beat.text, font: fitted.font)
+      let layer = textLayer(drawn, size: fitted.size)
+      layer.position = CGPoint(x: renderSize.width / 2, y: renderSize.height / 2)
+      parent.addSublayer(reveal(layer, start: beat.start, end: end, videoDuration: duration))
     }
 
     composition.animationTool = AVVideoCompositionCoreAnimationTool(postProcessingAsVideoLayer: videoLayer, in: parent)
+  }
+
+  private static func reveal(_ content: CALayer, start: Double, end: Double, videoDuration: Double) -> CALayer {
+    let host = CALayer()
+    host.bounds = content.bounds
+    host.position = content.position
+    host.anchorPoint = CGPoint(x: 0.5, y: 0.5)
+    host.masksToBounds = false
+    host.opacity = 0
+    content.position = CGPoint(x: host.bounds.midX, y: host.bounds.midY)
+    host.addSublayer(content)
+
+    let total = max(videoDuration.isFinite ? videoDuration : 0.4, 0.4)
+    let shown = min(start + 0.12, end)
+    let hiding = max(shown + 0.04, end - 0.1)
+    let anim = CAKeyframeAnimation(keyPath: "opacity")
+    anim.values = [0, 0, 1, 1, 0, 0].map { NSNumber(value: $0) }
+    anim.keyTimes = cueTimes([0, start, shown, hiding, end, total], total: total)
+    anim.duration = total
+    anim.beginTime = AVCoreAnimationBeginTimeAtZero
+    anim.calculationMode = .linear
+    anim.fillMode = .both
+    anim.isRemovedOnCompletion = false
+    host.add(anim, forKey: "poster-hold")
+    return host
+  }
+
+  private static func cueTimes(_ marks: [Double], total: Double) -> [NSNumber] {
+    let total = max(total, 0.2)
+    let count = marks.count
+    guard count >= 2 else { return [0, 1] }
+    let step = min(0.004, 0.5 / Double(count))
+    var times = Array(repeating: 0.0, count: count)
+    times[count - 1] = 1
+    if count > 2 {
+      for index in 1..<(count - 1) {
+        let mark = marks[index].isFinite ? marks[index] : 0
+        let raw = min(max(mark / total, 0), 1)
+        let floor = times[index - 1] + step
+        let ceiling = 1 - step * Double(count - 1 - index)
+        times[index] = min(max(raw, floor), max(ceiling, floor))
+      }
+    }
+    return times.map { NSNumber(value: $0) }
   }
 
   private static func rankHeadline(_ headline: String, font: UIFont) -> NSAttributedString {
@@ -746,75 +882,6 @@ enum PosterMaker {
       context: nil
     )
     return CGSize(width: width, height: ceil(bounds.height) + font.pointSize * 0.45)
-  }
-
-  private static func hold(_ layer: CALayer, start: Double, end: Double, videoDuration: Double) {
-    let video = max(videoDuration, 0.4)
-    let begin = min(max(start / video, 0), 0.96)
-    let show = min(max((start + 0.22) / video, begin + 0.012), 0.97)
-    var hide = min(max(end / video, show + 0.012), 1)
-    if hide >= 0.995 {
-      hide = 1
-    }
-    let anim = CAKeyframeAnimation(keyPath: "opacity")
-    if begin < 0.008 {
-      if hide >= 0.995 {
-        anim.values = [0, 1, 1]
-        anim.keyTimes = [0, NSNumber(value: show), 1]
-      } else {
-        anim.values = [0, 1, 1, 0]
-        anim.keyTimes = [0, NSNumber(value: show), NSNumber(value: hide), 1]
-      }
-    } else if hide >= 0.995 {
-      anim.values = [0, 0, 1, 1]
-      anim.keyTimes = [0, NSNumber(value: begin), NSNumber(value: show), 1]
-    } else {
-      anim.values = [0, 0, 1, 1, 0]
-      anim.keyTimes = [0, NSNumber(value: begin), NSNumber(value: show), NSNumber(value: hide), 1]
-    }
-    anim.duration = video
-    anim.beginTime = AVCoreAnimationBeginTimeAtZero
-    anim.fillMode = .both
-    anim.isRemovedOnCompletion = false
-    layer.opacity = 0
-    layer.add(anim, forKey: "poster-hold")
-  }
-
-  private static func burn(_ rows: [String], into composition: AVMutableVideoComposition, renderSize: CGSize, duration: Double) {
-    let parent = CALayer()
-    let videoLayer = CALayer()
-    let canvas = CGRect(origin: .zero, size: renderSize)
-    parent.frame = canvas
-    videoLayer.frame = canvas
-    parent.isGeometryFlipped = true
-    parent.addSublayer(videoLayer)
-
-    let each = duration / Double(max(rows.count, 1))
-    for (index, row) in rows.enumerated() {
-      let start = Double(index) * each
-      let end = index == rows.count - 1 ? duration : min(start + each, duration)
-      let fitted = fitSentence(row, canvas: renderSize)
-      let layer = textLayer(styled(row, font: fitted.font), size: fitted.size)
-      layer.position = CGPoint(x: renderSize.width / 2, y: renderSize.height / 2)
-      hold(layer, start: start, end: end, videoDuration: max(duration, end))
-      spinIn(layer, delay: start)
-      parent.addSublayer(layer)
-    }
-
-    composition.animationTool = AVVideoCompositionCoreAnimationTool(postProcessingAsVideoLayer: videoLayer, in: parent)
-  }
-
-  private static func spinIn(_ layer: CALayer, delay: Double) {
-    layer.transform = CATransform3DIdentity
-    let scale = CABasicAnimation(keyPath: "transform.scale")
-    scale.fromValue = 0.92
-    scale.toValue = 1
-    scale.duration = 0.28
-    scale.beginTime = AVCoreAnimationBeginTimeAtZero + delay
-    scale.timingFunction = CAMediaTimingFunction(name: .easeOut)
-    scale.fillMode = .both
-    scale.isRemovedOnCompletion = false
-    layer.add(scale, forKey: "poster-scale")
   }
 
   private static func styled(_ text: String, font: UIFont) -> NSAttributedString {
@@ -974,7 +1041,8 @@ enum PosterMaker {
   private static func export(
     composition: AVMutableComposition,
     videoComposition: AVMutableVideoComposition,
-    output: URL
+    output: URL,
+    audioMix: AVMutableAudioMix?
   ) async throws {
     if FileManager.default.fileExists(atPath: output.path) {
       try FileManager.default.removeItem(at: output)
@@ -1002,6 +1070,7 @@ enum PosterMaker {
       session.outputURL = output
       session.outputFileType = .mp4
       session.videoComposition = videoComposition
+      session.audioMix = audioMix
       session.shouldOptimizeForNetworkUse = false
       let failure: String? = await withCheckedContinuation { continuation in
         session.exportAsynchronously {
@@ -1109,13 +1178,6 @@ enum PosterMaker {
       .concatenating(CGAffineTransform(translationX: -centerX, y: -centerY))
       .concatenating(CGAffineTransform(scaleX: scale, y: scale))
       .concatenating(CGAffineTransform(translationX: centerX, y: centerY))
-  }
-
-  private static func scriptSeconds(ranked: Bool, rankCount: Int, lineCount: Int) -> Double {
-    if ranked {
-      return 1.4 + Double(max(rankCount, 1)) * 4.2
-    }
-    return max(4, Double(max(lineCount, 1)) * 1.6)
   }
 
   private static func flag(_ options: [String: Any], key: String, default defaultValue: Bool) -> Bool {

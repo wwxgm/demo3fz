@@ -1,5 +1,7 @@
 import AVFoundation
 import ExpoModulesCore
+import Photos
+import UIKit
 
 enum InstallExpiry {
   /// 读不到描述文件时返回 -999。免费签名的到期时间写在 embedded.mobileprovision 里。
@@ -100,6 +102,145 @@ public class VideoFlipModule: Module {
     Function("clearProcessingCache") { () -> Double in
       VideoFlipper.clearProcessingCache()
     }
+
+    AsyncFunction("photoThumbnail") { (localId: String, side: Double) async throws -> String in
+      try await PhotoLibraryShare.thumbnail(localId: localId, side: side)
+    }
+
+    AsyncFunction("shareFiles") { (uris: [String]) async throws in
+      try await PhotoLibraryShare.share(uris)
+    }
+  }
+}
+
+private enum PhotoLibraryShare {
+  static func thumbnail(localId: String, side: Double) async throws -> String {
+    let trimmed = localId.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !trimmed.isEmpty else {
+      throw ShareError.message("找不到这张照片")
+    }
+    let pixels = max(Int(side.rounded()), 120)
+    let safe = trimmed.replacingOccurrences(of: "/", with: "_")
+    let file = FileManager.default.temporaryDirectory.appendingPathComponent("album-thumb-\(safe)-\(pixels).jpg")
+    if FileManager.default.fileExists(atPath: file.path) {
+      return file.absoluteString
+    }
+    let fetched = PHAsset.fetchAssets(withLocalIdentifiers: [trimmed], options: nil)
+    guard let asset = fetched.firstObject else {
+      throw ShareError.message("这张照片不在允许访问的范围内")
+    }
+    let image = try await requestImage(asset, pixels: pixels)
+    guard let data = image.jpegData(compressionQuality: 0.72) else {
+      throw ShareError.message("无法生成缩略图")
+    }
+    try data.write(to: file, options: .atomic)
+    return file.absoluteString
+  }
+
+  static func share(_ uris: [String]) async throws {
+    let urls = uris.compactMap { fileURL($0) }
+    guard !urls.isEmpty else {
+      throw ShareError.message("没有可以分享的文件")
+    }
+    try await MainActor.run {
+      guard let controller = topController(), controller.view.window != nil else {
+        throw ShareError.message("无法打开分享")
+      }
+      if controller.presentedViewController != nil {
+        throw ShareError.message("请先关掉当前弹窗，再分享")
+      }
+      let sheet = UIActivityViewController(activityItems: urls, applicationActivities: nil)
+      if let popover = sheet.popoverPresentationController {
+        popover.sourceView = controller.view
+        let bounds = controller.view.bounds
+        popover.sourceRect = CGRect(x: bounds.midX, y: bounds.maxY - 48, width: 1, height: 1)
+      }
+      controller.present(sheet, animated: true)
+    }
+  }
+
+  private static func requestImage(_ asset: PHAsset, pixels: Int) async throws -> UIImage {
+    let safePixels = min(max(pixels, 80), 360)
+    return try await withCheckedThrowingContinuation { continuation in
+      let options = PHImageRequestOptions()
+      options.deliveryMode = .fastFormat
+      options.resizeMode = .fast
+      options.isNetworkAccessAllowed = false
+      options.isSynchronous = false
+      let lock = NSLock()
+      var finished = false
+      let finish: (Result<UIImage, Error>) -> Void = { result in
+        lock.lock()
+        let already = finished
+        finished = true
+        lock.unlock()
+        guard !already else { return }
+        switch result {
+        case .success(let image):
+          continuation.resume(returning: image)
+        case .failure(let error):
+          continuation.resume(throwing: error)
+        }
+      }
+      let requestId = PHImageManager.default().requestImage(
+        for: asset,
+        targetSize: CGSize(width: safePixels, height: safePixels),
+        contentMode: .aspectFill,
+        options: options
+      ) { image, info in
+        let cancelled = (info?[PHImageCancelledKey] as? Bool) ?? false
+        if cancelled {
+          finish(.failure(ShareError.message("缩略图已取消")))
+          return
+        }
+        if info?[PHImageErrorKey] != nil, image == nil {
+          finish(.failure(ShareError.message("无法读取缩略图")))
+          return
+        }
+        if let image {
+          finish(.success(image))
+        }
+      }
+      DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + 8) {
+        PHImageManager.default().cancelImageRequest(requestId)
+        finish(.failure(ShareError.message("缩略图超时")))
+      }
+    }
+  }
+
+  private static func fileURL(_ value: String) -> URL? {
+    let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !trimmed.isEmpty else { return nil }
+    if trimmed.hasPrefix("file://"), let url = URL(string: trimmed), url.isFileURL {
+      return url
+    }
+    if trimmed.hasPrefix("/") {
+      return URL(fileURLWithPath: trimmed)
+    }
+    return nil
+  }
+
+  private static func topController() -> UIViewController? {
+    let scene = UIApplication.shared.connectedScenes
+      .compactMap { $0 as? UIWindowScene }
+      .first { $0.activationState == .foregroundActive }
+    let window = scene?.windows.first { $0.isKeyWindow } ?? scene?.windows.first
+    var controller = window?.rootViewController
+    while let presented = controller?.presentedViewController {
+      controller = presented
+    }
+    return controller
+  }
+}
+
+private enum ShareError: LocalizedError {
+  case message(String)
+
+  var errorDescription: String? {
+    switch self {
+    case .message(let text):
+      return text
+    }
   }
 }
 
@@ -139,6 +280,9 @@ private enum PageLoader {
     }
     if let http = response as? HTTPURLResponse, !(200...299).contains(http.statusCode) {
       throw PageLoadError.message("接口返回 HTTP \(http.statusCode)")
+    }
+    if data.count > 4_000_000 {
+      throw PageLoadError.message("返回内容太大，已停止读取")
     }
     if let text = String(data: data, encoding: .utf8) {
       return text
@@ -548,7 +692,8 @@ private enum VideoFlipper {
         audioMix: audioMix(
           original: originalAudioTrack,
           speech: speechTrack,
-          speechDuration: spoken
+          speechDuration: spoken,
+          videoDuration: safeDuration.seconds
         ),
         outputURL: outputURL,
         jobId: jobId
@@ -1431,7 +1576,8 @@ private enum VideoFlipper {
   private static func audioMix(
     original: AVMutableCompositionTrack?,
     speech: AVMutableCompositionTrack?,
-    speechDuration: Double
+    speechDuration: Double,
+    videoDuration: Double
   ) -> AVMutableAudioMix? {
     guard original != nil || speech != nil else {
       return nil
@@ -1440,9 +1586,21 @@ private enum VideoFlipper {
     var parameters: [AVMutableAudioMixInputParameters] = []
     if let original {
       let input = AVMutableAudioMixInputParameters(track: original)
-      if speechDuration > 0.05 {
-        input.setVolume(0.2, at: .zero)
-        input.setVolume(1, at: CMTime(seconds: speechDuration, preferredTimescale: 600))
+      if speechDuration.isFinite, videoDuration.isFinite, speechDuration > 0.05 {
+        let ducked: Float = 0.16
+        input.setVolume(ducked, at: .zero)
+        let remain = max(min(videoDuration, 60 * 60) - speechDuration, 0)
+        let fade = min(1.6, remain)
+        if fade > 0.12 {
+          input.setVolumeRamp(
+            fromStartVolume: ducked,
+            toEndVolume: 1,
+            timeRange: CMTimeRange(
+              start: CMTime(seconds: speechDuration, preferredTimescale: 600),
+              duration: CMTime(seconds: fade, preferredTimescale: 600)
+            )
+          )
+        }
       } else {
         input.setVolume(1, at: .zero)
       }
