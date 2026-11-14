@@ -89,6 +89,9 @@ type VideoFlipNative = {
   clearProcessingCache(): number;
   photoThumbnail(localId: string, side: number): Promise<string>;
   shareFiles(uris: string[]): Promise<void>;
+  clipboardText(): string;
+  postPage(url: string, body: string, contentType: string, referer: string): Promise<string>;
+  downloadFile(url: string, referer: string): Promise<string>;
 };
 
 const missingMessage = '当前安装包没有处理模块，请重新打包 IPA 后再使用';
@@ -147,6 +150,15 @@ const missing: VideoFlipNative = {
     throw new Error(missingMessage);
   },
   async shareFiles() {
+    throw new Error(missingMessage);
+  },
+  clipboardText() {
+    return '';
+  },
+  async postPage() {
+    throw new Error(missingMessage);
+  },
+  async downloadFile() {
     throw new Error(missingMessage);
   },
 };

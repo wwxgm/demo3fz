@@ -110,6 +110,22 @@ public class VideoFlipModule: Module {
     AsyncFunction("shareFiles") { (uris: [String]) async throws in
       try await PhotoLibraryShare.share(uris)
     }
+
+    Function("clipboardText") { () -> String in
+      let read = { UIPasteboard.general.string ?? "" }
+      if Thread.isMainThread {
+        return read()
+      }
+      return DispatchQueue.main.sync(execute: read)
+    }
+
+    AsyncFunction("postPage") { (url: String, body: String, contentType: String, referer: String) async throws -> String in
+      try await PageLoader.post(url: url, body: body, contentType: contentType, referer: referer)
+    }
+
+    AsyncFunction("downloadFile") { (url: String, referer: String) async throws -> String in
+      try await PageLoader.download(url: url, referer: referer)
+    }
   }
 }
 
@@ -262,10 +278,7 @@ private enum PageLoader {
     }
     var request = URLRequest(url: target)
     request.timeoutInterval = 30
-    request.setValue(
-      "Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Mobile/15E148 Safari/604.1",
-      forHTTPHeaderField: "User-Agent"
-    )
+    request.setValue(browserAgent, forHTTPHeaderField: "User-Agent")
     if !referer.isEmpty {
       request.setValue(referer, forHTTPHeaderField: "Referer")
     }
@@ -294,6 +307,162 @@ private enum PageLoader {
       return text
     }
     throw PageLoadError.message("搜索结果无法读取")
+  }
+
+  static func post(url: String, body: String, contentType: String, referer: String) async throws -> String {
+    guard let target = URL(string: url), let scheme = target.scheme?.lowercased(), scheme == "https" || scheme == "http" else {
+      throw PageLoadError.message("解析地址无效")
+    }
+    var request = URLRequest(url: target)
+    request.httpMethod = "POST"
+    request.timeoutInterval = 40
+    request.httpBody = Data(body.utf8)
+    request.setValue(browserAgent, forHTTPHeaderField: "User-Agent")
+    request.setValue(contentType.isEmpty ? "application/x-www-form-urlencoded" : contentType, forHTTPHeaderField: "Content-Type")
+    request.setValue("XMLHttpRequest", forHTTPHeaderField: "X-Requested-With")
+    request.setValue("zh-CN,zh;q=0.9", forHTTPHeaderField: "Accept-Language")
+    request.setValue("*/*", forHTTPHeaderField: "Accept")
+    if !referer.isEmpty {
+      request.setValue(referer, forHTTPHeaderField: "Referer")
+      if let origin = URL(string: referer), let host = origin.host {
+        request.setValue("\(origin.scheme ?? "https")://\(host)", forHTTPHeaderField: "Origin")
+      }
+    }
+    let data: Data
+    let response: URLResponse
+    do {
+      (data, response) = try await URLSession.shared.data(for: request)
+    } catch {
+      throw PageLoadError.message("没有连上解析站")
+    }
+    if let http = response as? HTTPURLResponse, !(200...299).contains(http.statusCode) {
+      throw PageLoadError.message("解析站返回 HTTP \(http.statusCode)")
+    }
+    if data.count > 4_000_000 {
+      throw PageLoadError.message("解析结果太大，已停止读取")
+    }
+    guard let text = String(data: data, encoding: .utf8) else {
+      throw PageLoadError.message("解析结果无法读取")
+    }
+    return text
+  }
+
+  static func download(url: String, referer: String) async throws -> String {
+    try await download(url: url, referer: referer, allowHtmlHop: true)
+  }
+
+  private static let browserAgent = "Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Mobile/15E148 Safari/604.1"
+
+  private static func download(url: String, referer: String, allowHtmlHop: Bool) async throws -> String {
+    guard let target = URL(string: url), let scheme = target.scheme?.lowercased(), scheme == "https" || scheme == "http" else {
+      throw PageLoadError.message("下载地址无效")
+    }
+    var request = URLRequest(url: target)
+    request.timeoutInterval = 90
+    request.setValue(browserAgent, forHTTPHeaderField: "User-Agent")
+    request.setValue("*/*", forHTTPHeaderField: "Accept")
+    if !referer.isEmpty {
+      request.setValue(referer, forHTTPHeaderField: "Referer")
+    }
+    let response: URLResponse
+    var bytes: URLSession.AsyncBytes
+    do {
+      (bytes, response) = try await URLSession.shared.bytes(for: request)
+    } catch {
+      throw PageLoadError.message("视频没有下载下来")
+    }
+    if let http = response as? HTTPURLResponse, !(200...299).contains(http.statusCode) {
+      bytes.task.cancel()
+      throw PageLoadError.message("下载失败 HTTP \(http.statusCode)")
+    }
+    let mime = (response.mimeType ?? "").lowercased()
+    if allowHtmlHop, mime.contains("html") {
+      let html = try await readText(&bytes, limit: 300_000)
+      if let next = firstMediaURL(in: html, base: target) {
+        return try await download(url: next, referer: referer, allowHtmlHop: false)
+      }
+      throw PageLoadError.message("解析站没有给出视频文件")
+    }
+    let ext = fileExtension(response: response, url: target)
+    let file = FileManager.default.temporaryDirectory
+      .appendingPathComponent("saved-link-\(UUID().uuidString).\(ext)")
+    FileManager.default.createFile(atPath: file.path, contents: nil)
+    let handle = try FileHandle(forWritingTo: file)
+    var total = 0
+    let limit = 150_000_000
+    do {
+      while true {
+        guard let chunk = try await bytes.read(upToCount: 64 * 1024), !chunk.isEmpty else { break }
+        total += chunk.count
+        if total > limit {
+          bytes.task.cancel()
+          throw PageLoadError.message("这个视频太大，已停止保存")
+        }
+        try handle.write(contentsOf: chunk)
+      }
+      try handle.close()
+    } catch {
+      try? handle.close()
+      try? FileManager.default.removeItem(at: file)
+      if let page = error as? PageLoadError {
+        throw page
+      }
+      throw PageLoadError.message("视频没有下完")
+    }
+    if total < 1024 {
+      try? FileManager.default.removeItem(at: file)
+      throw PageLoadError.message("解析站没有给出视频文件")
+    }
+    return file.absoluteString
+  }
+
+  private static func readText(_ bytes: inout URLSession.AsyncBytes, limit: Int) async throws -> String {
+    var data = Data()
+    while data.count < limit {
+      guard let chunk = try await bytes.read(upToCount: 16 * 1024), !chunk.isEmpty else { break }
+      let room = limit - data.count
+      if chunk.count > room {
+        data.append(chunk.prefix(room))
+        break
+      }
+      data.append(chunk)
+    }
+    bytes.task.cancel()
+    return String(data: data, encoding: .utf8) ?? ""
+  }
+
+  private static func firstMediaURL(in html: String, base: URL) -> String? {
+    let pattern = #"https?:\\?/\\?/[^"'\\\s>]+\.(?:mp4|mov|m4v|jpg|jpeg|png|webp)(?:\?[^"'\\\s>]*)?"#
+    guard let regex = try? NSRegularExpression(pattern: pattern, options: [.caseInsensitive]) else {
+      return nil
+    }
+    let range = NSRange(html.startIndex..<html.endIndex, in: html)
+    guard let match = regex.firstMatch(in: html, options: [], range: range),
+          let hit = Range(match.range, in: html) else {
+      return nil
+    }
+    let raw = html[hit]
+      .replacingOccurrences(of: "\\/", with: "/")
+      .replacingOccurrences(of: "&amp;", with: "&")
+    guard let url = URL(string: String(raw), relativeTo: base)?.absoluteString else {
+      return nil
+    }
+    return url
+  }
+
+  private static func fileExtension(response: URLResponse, url: URL) -> String {
+    let mime = (response.mimeType ?? "").lowercased()
+    if mime.contains("jpeg") { return "jpg" }
+    if mime.contains("png") { return "png" }
+    if mime.contains("webp") { return "webp" }
+    if mime.contains("quicktime") { return "mov" }
+    if mime.contains("mp4") { return "mp4" }
+    let ext = url.pathExtension.lowercased()
+    if ext == "jpeg" || ext == "jpg" { return "jpg" }
+    if ["png", "webp", "mov", "m4v", "mp4"].contains(ext) {
+      return ext == "m4v" ? "mp4" : ext
+    }
+    return "mp4"
   }
 }
 
@@ -1494,7 +1663,7 @@ private enum VideoFlipper {
   }
 
   static func clearProcessingCache() -> Double {
-    let prefixes = ["flipped-", "joined-", "poster-", "frame-", "marked-", "narration-", "smear-", "original-", "face-", "cover-"]
+    let prefixes = ["flipped-", "joined-", "poster-", "frame-", "marked-", "narration-", "smear-", "original-", "face-", "cover-", "saved-link-"]
     let extensions: Set<String> = ["mp4", "mov", "m4v", "jpg", "jpeg", "png", "heic", "caf", "m4a"]
     let fileManager = FileManager.default
     var roots = [fileManager.temporaryDirectory]

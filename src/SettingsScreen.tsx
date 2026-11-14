@@ -14,10 +14,11 @@ import {
 } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { AlbumShareScreen } from './AlbumShareScreen';
+import { SaveLinkScreen } from './SaveLinkScreen';
 import VideoFlip from '../modules/video-flip';
 import { themeColors, useTheme, type Appearance } from './theme';
 
-type Page = 'menu' | 'music' | 'footage' | 'look' | 'urls' | 'library';
+type Page = 'menu' | 'music' | 'footage' | 'look' | 'urls' | 'library' | 'parse';
 
 type Material = {
   title: string;
@@ -324,7 +325,7 @@ export function SettingsScreen() {
     return (
       <View style={[styles.screen, { paddingTop: insets.top + 8 }]}>
         <Text style={[styles.title, { color: palette.text }]}>设置</Text>
-        <Text style={[styles.subtitle, { color: palette.muted }]}>点进去查看素材、网址、相册，或调整外观。</Text>
+        <Text style={[styles.subtitle, { color: palette.muted }]}>点进去查看素材、网址、相册，或保存短视频。</Text>
         <ScrollView contentContainerStyle={styles.list}>
           <Pressable
             style={[styles.row, { backgroundColor: palette.card, borderColor: palette.line }]}
@@ -360,6 +361,16 @@ export function SettingsScreen() {
           </Pressable>
           <Pressable
             style={[styles.row, { backgroundColor: palette.card, borderColor: palette.line }]}
+            onPress={() => setPage('parse')}
+          >
+            <View style={styles.rowBody}>
+              <Text style={[styles.rowTitle, { color: palette.text }]}>解析短视频</Text>
+              <Text style={[styles.rowHint, { color: palette.muted }]}>粘贴 Instagram、TikTok 链接，保存到相册</Text>
+            </View>
+            <Text style={[styles.chevron, { color }]}>进入</Text>
+          </Pressable>
+          <Pressable
+            style={[styles.row, { backgroundColor: palette.card, borderColor: palette.line }]}
             onPress={() => setPage('library')}
           >
             <View style={styles.rowBody}>
@@ -385,6 +396,10 @@ export function SettingsScreen() {
 
   if (page === 'library') {
     return <AlbumShareScreen onBack={() => setPage('menu')} />;
+  }
+
+  if (page === 'parse') {
+    return <SaveLinkScreen onBack={() => setPage('menu')} />;
   }
 
   if (page === 'urls') {
