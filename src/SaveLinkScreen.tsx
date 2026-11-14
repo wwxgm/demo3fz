@@ -61,7 +61,6 @@ export function SaveLinkScreen({ onBack }: { onBack?: () => void }) {
   const [draft, setDraft] = useState('');
   const [rows, setRows] = useState<Row[]>([]);
   const [flipOn, setFlipOn] = useState(true);
-  const [busy, setBusy] = useState(false);
   const [copiedId, setCopiedId] = useState('');
   const seen = useRef(new Set<string>());
   const flipOnRef = useRef(flipOn);
@@ -299,7 +298,6 @@ export function SaveLinkScreen({ onBack }: { onBack?: () => void }) {
       heldRef.current = false;
       VideoFlip.releaseBackground();
     }
-    setBusy(false);
     okRef.current = 0;
     failedRef.current = 0;
     if (ok === 0 && failed === 0) return;
@@ -471,7 +469,6 @@ export function SaveLinkScreen({ onBack }: { onBack?: () => void }) {
       );
       queueRef.current.push(...still);
       runningRef.current = true;
-      setBusy(true);
       pump();
     } finally {
       savingLock.current = false;
@@ -548,7 +545,7 @@ export function SaveLinkScreen({ onBack }: { onBack?: () => void }) {
   return (
     <View style={[styles.screen, { paddingTop: insets.top + 8, backgroundColor: palette.background }]}>
       {onBack ? (
-        <Pressable onPress={onBack} hitSlop={8} disabled={busy}>
+        <Pressable onPress={onBack} hitSlop={8}>
           <Text style={[styles.back, { color }]}>返回</Text>
         </Pressable>
       ) : null}
@@ -1148,10 +1145,14 @@ const styles = StyleSheet.create({
   pasteWide: {
     width: 88,
     height: 44,
+    flexGrow: 0,
+    flexShrink: 0,
   },
   pastePlus: {
     width: 44,
     height: 44,
+    flexGrow: 0,
+    flexShrink: 0,
     borderRadius: 12,
     overflow: 'hidden',
   },
