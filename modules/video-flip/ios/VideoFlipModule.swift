@@ -112,11 +112,14 @@ public class VideoFlipModule: Module {
     }
 
     Function("clipboardText") { () -> String in
-      let read = { UIPasteboard.general.string ?? "" }
       if Thread.isMainThread {
-        return read()
+        return UIPasteboard.general.string ?? ""
       }
-      return DispatchQueue.main.sync(execute: read)
+      var text = ""
+      DispatchQueue.main.sync {
+        text = UIPasteboard.general.string ?? ""
+      }
+      return text
     }
 
     AsyncFunction("postPage") { (url: String, body: String, contentType: String, referer: String) async throws -> String in
@@ -347,11 +350,11 @@ private enum PageLoader {
     return text
   }
 
+  private static let browserAgent = "Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Mobile/15E148 Safari/604.1"
+
   static func download(url: String, referer: String) async throws -> String {
     try await download(url: url, referer: referer, allowHtmlHop: true)
   }
-
-  private static let browserAgent = "Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Mobile/15E148 Safari/604.1"
 
   private static func download(url: String, referer: String, allowHtmlHop: Bool) async throws -> String {
     guard let target = URL(string: url), let scheme = target.scheme?.lowercased(), scheme == "https" || scheme == "http" else {
@@ -364,71 +367,39 @@ private enum PageLoader {
     if !referer.isEmpty {
       request.setValue(referer, forHTTPHeaderField: "Referer")
     }
+    let data: Data
     let response: URLResponse
-    var bytes: URLSession.AsyncBytes
     do {
-      (bytes, response) = try await URLSession.shared.bytes(for: request)
+      (data, response) = try await URLSession.shared.data(for: request)
     } catch {
       throw PageLoadError.message("视频没有下载下来")
     }
     if let http = response as? HTTPURLResponse, !(200...299).contains(http.statusCode) {
-      bytes.task.cancel()
       throw PageLoadError.message("下载失败 HTTP \(http.statusCode)")
     }
     let mime = (response.mimeType ?? "").lowercased()
     if allowHtmlHop, mime.contains("html") {
-      let html = try await readText(&bytes, limit: 300_000)
-      if let next = firstMediaURL(in: html, base: target) {
+      let sample = data.count > 300_000 ? data.subdata(in: 0..<300_000) : data
+      if let html = String(data: sample, encoding: .utf8), let next = firstMediaURL(in: html, base: target) {
         return try await download(url: next, referer: referer, allowHtmlHop: false)
       }
       throw PageLoadError.message("解析站没有给出视频文件")
     }
+    if mime.contains("html") || data.count < 1024 {
+      throw PageLoadError.message("解析站没有给出视频文件")
+    }
+    if data.count > 80_000_000 {
+      throw PageLoadError.message("这个视频太大，已停止保存")
+    }
     let ext = fileExtension(response: response, url: target)
     let file = FileManager.default.temporaryDirectory
       .appendingPathComponent("saved-link-\(UUID().uuidString).\(ext)")
-    FileManager.default.createFile(atPath: file.path, contents: nil)
-    let handle = try FileHandle(forWritingTo: file)
-    var total = 0
-    let limit = 150_000_000
     do {
-      while true {
-        guard let chunk = try await bytes.read(upToCount: 64 * 1024), !chunk.isEmpty else { break }
-        total += chunk.count
-        if total > limit {
-          bytes.task.cancel()
-          throw PageLoadError.message("这个视频太大，已停止保存")
-        }
-        try handle.write(contentsOf: chunk)
-      }
-      try handle.close()
+      try data.write(to: file, options: .atomic)
     } catch {
-      try? handle.close()
-      try? FileManager.default.removeItem(at: file)
-      if let page = error as? PageLoadError {
-        throw page
-      }
-      throw PageLoadError.message("视频没有下完")
-    }
-    if total < 1024 {
-      try? FileManager.default.removeItem(at: file)
-      throw PageLoadError.message("解析站没有给出视频文件")
+      throw PageLoadError.message("视频没有保存下来")
     }
     return file.absoluteString
-  }
-
-  private static func readText(_ bytes: inout URLSession.AsyncBytes, limit: Int) async throws -> String {
-    var data = Data()
-    while data.count < limit {
-      guard let chunk = try await bytes.read(upToCount: 16 * 1024), !chunk.isEmpty else { break }
-      let room = limit - data.count
-      if chunk.count > room {
-        data.append(chunk.prefix(room))
-        break
-      }
-      data.append(chunk)
-    }
-    bytes.task.cancel()
-    return String(data: data, encoding: .utf8) ?? ""
   }
 
   private static func firstMediaURL(in html: String, base: URL) -> String? {
