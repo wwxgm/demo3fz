@@ -1,7 +1,8 @@
 import { useEffect, useRef, useState } from 'react';
 import {
-  ActivityIndicator,
   Alert,
+  AppState,
+  Image,
   Linking,
   Pressable,
   ScrollView,
@@ -12,7 +13,7 @@ import {
 } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import * as MediaLibrary from 'expo-media-library';
-import VideoFlip from '../modules/video-flip';
+import VideoFlip, { LinkPasteButton } from '../modules/video-flip';
 import { errorText } from './runtime';
 import { useTheme } from './theme';
 
@@ -47,9 +48,11 @@ type Row = {
   progress: number;
   message: string;
   phase: RowPhase;
+  preview: string;
 };
 
 const MAX_LINKS = 20;
+const CONCURRENCY = 3;
 
 export function SaveLinkScreen({ onBack }: { onBack?: () => void }) {
   const insets = useSafeAreaInsets();
@@ -58,7 +61,27 @@ export function SaveLinkScreen({ onBack }: { onBack?: () => void }) {
   const [rows, setRows] = useState<Row[]>([]);
   const [flipOn, setFlipOn] = useState(true);
   const [busy, setBusy] = useState(false);
+  const [copiedId, setCopiedId] = useState('');
   const seen = useRef(new Set<string>());
+  const flipOnRef = useRef(flipOn);
+  const runningRef = useRef(false);
+  const heldRef = useRef(false);
+  const savingLock = useRef(false);
+  const queueRef = useRef<Row[]>([]);
+  const queuedIds = useRef(new Set<string>());
+  const workersRef = useRef(0);
+  const okRef = useRef(0);
+  const failedRef = useRef(0);
+  const flipChain = useRef(Promise.resolve());
+  const rowsRef = useRef(rows);
+  const dropped = useRef(new Set<string>());
+  const previewRef = useRef(new Map<string, string>());
+  const resumeOnActive = useRef(false);
+  const interruptedRef = useRef(new Set<string>());
+  const startRowsRef = useRef<(ids: string[]) => Promise<void>>(async () => {});
+  const pumpRef = useRef<() => void>(() => {});
+  flipOnRef.current = flipOn;
+  rowsRef.current = rows;
 
   useEffect(() => {
     const timer = setInterval(() => {
@@ -89,13 +112,12 @@ export function SaveLinkScreen({ onBack }: { onBack?: () => void }) {
   };
 
   const addLink = (raw: string, fromClipboard: boolean) => {
-    if (busy) return;
     const link = findLink(raw);
     if (!link) {
       Alert.alert(
         fromClipboard ? '没有读到链接' : '没有链接',
         fromClipboard
-          ? '先复制一条公开视频链接。如果手机问是否允许粘贴，点允许后再点一次。'
+          ? '先复制公开视频链接。多条时一行一条。'
           : '在输入框里输入或贴上一条公开视频链接，再点加入。',
       );
       return;
@@ -121,124 +143,400 @@ export function SaveLinkScreen({ onBack }: { onBack?: () => void }) {
         progress: 0,
         message: '等待保存',
         phase: 'ready',
+        preview: '',
       },
     ]);
     if (!fromClipboard) setDraft('');
   };
 
-  const paste = () => addLink(VideoFlip.clipboardText(), true);
+  const addFromClipboard = (raw: string, multiple: boolean) => {
+    const links = findLinks(raw);
+    const picked = multiple ? links : links.slice(0, 1);
+    if (!multiple) {
+      addLink(picked[0] || '', true);
+      return;
+    }
+    if (picked.length === 0) {
+      Alert.alert('没有读到链接', '先复制公开视频链接。多条时一行一条。');
+      return;
+    }
+    const accepted: Row[] = [];
+    let duplicate = 0;
+    let unsupported = 0;
+    let overflow = 0;
+    for (const link of picked) {
+      if (!platformOf(link)) {
+        unsupported += 1;
+        continue;
+      }
+      if (seen.current.has(link)) {
+        duplicate += 1;
+        continue;
+      }
+      if (seen.current.size >= MAX_LINKS) {
+        overflow += 1;
+        continue;
+      }
+      seen.current.add(link);
+      accepted.push({
+        id: `${Date.now()}-${accepted.length}-${Math.random().toString(16).slice(2)}`,
+        link,
+        progress: 0,
+        message: '等待保存',
+        phase: 'ready',
+        preview: '',
+      });
+    }
+    if (accepted.length > 0) {
+      setRows((prev) => [...prev, ...accepted]);
+    }
+    if (accepted.length === 0 && duplicate > 0 && unsupported === 0 && overflow === 0) {
+      Alert.alert('已经在列表里', '这些链接和已有的完全一样，没有重复加入。');
+      return;
+    }
+    if (accepted.length === 0 && overflow > 0) {
+      Alert.alert('已经满了', `一次最多 ${MAX_LINKS} 条。先保存或删掉几条再加。`);
+      return;
+    }
+    if (accepted.length === 0) {
+      Alert.alert('没有读到链接', '没有找到可以加入的公开视频链接。多条时一行一条。');
+      return;
+    }
+    if (duplicate > 0 || unsupported > 0 || overflow > 0) {
+      const notes = [
+        duplicate > 0 ? `重复 ${duplicate} 条` : '',
+        unsupported > 0 ? `不支持 ${unsupported} 条` : '',
+        overflow > 0 ? `超出 ${overflow} 条` : '',
+      ].filter(Boolean);
+      Alert.alert('已加入一部分', `加入 ${accepted.length} 条。${notes.join('，')}。`);
+    }
+  };
+
+  const pasteText = (event: { nativeEvent?: { text?: string }; text?: string }, multiple: boolean) => {
+    addFromClipboard(event.nativeEvent?.text ?? event.text ?? '', multiple);
+  };
+
+  const rememberPreview = (id: string, uri: string) => {
+    const previous = previewRef.current.get(id) || '';
+    if (previous.startsWith('file:') && previous !== uri) VideoFlip.removeTempFile(previous);
+    previewRef.current.set(id, uri);
+    patch(id, { preview: uri });
+  };
+
+  const dropPreview = (id: string) => {
+    const preview = previewRef.current.get(id) || '';
+    if (preview.startsWith('file:')) VideoFlip.removeTempFile(preview);
+    previewRef.current.delete(id);
+  };
+
+  const clearList = () => {
+    if (rowsRef.current.length === 0) {
+      Alert.alert('列表是空的', '还没有链接可以清空。');
+      return;
+    }
+    const runningNow = () => {
+      const running = new Set(queuedIds.current);
+      queueRef.current.forEach((item) => running.delete(item.id));
+      return running;
+    };
+    const drop = () => {
+      const running = runningNow();
+      queueRef.current = [];
+      const next = rowsRef.current.filter((row) => running.has(row.id));
+      rowsRef.current.forEach((row) => {
+        if (running.has(row.id)) return;
+        queuedIds.current.delete(row.id);
+        dropped.current.add(row.id);
+        dropPreview(row.id);
+        VideoFlip.cancelDownload(row.id);
+        VideoFlip.cancelFlip(row.id);
+      });
+      seen.current.clear();
+      next.forEach((row) => seen.current.add(row.link));
+      setRows(next);
+    };
+    const kept = rowsRef.current.filter((row) => runningNow().has(row.id)).length;
+    Alert.alert(
+      '清空列表',
+      kept > 0 ? `正在处理的 ${kept} 条会留着，其余都会去掉。去掉之后可以重新粘贴。` : '列表里的链接都会去掉，之后可以重新粘贴。',
+      [
+        { text: '取消', style: 'cancel' },
+        { text: '清空', style: 'destructive', onPress: drop },
+      ],
+    );
+  };
 
   const removeRow = (row: Row) => {
-    if (busy) return;
+    dropped.current.add(row.id);
+    queuedIds.current.delete(row.id);
+    queueRef.current = queueRef.current.filter((item) => item.id !== row.id);
     seen.current.delete(row.link);
+    dropPreview(row.id);
+    VideoFlip.cancelDownload(row.id);
+    VideoFlip.cancelFlip(row.id);
     setRows((prev) => prev.filter((item) => item.id !== row.id));
   };
 
-  const save = async () => {
-    if (busy) return;
-    const pending = rows.filter((row) => row.phase === 'ready' || row.phase === 'error');
-    if (pending.length === 0) {
-      Alert.alert('没有要保存的链接', '先点粘贴或 + 把链接加到列表里，再点保存。');
+  const copyRow = (row: Row) => {
+    VideoFlip.copyText(row.link);
+    setCopiedId(row.id);
+    setTimeout(() => {
+      setCopiedId((current) => (current === row.id ? '' : current));
+    }, 1200);
+  };
+
+  const finishIfIdle = () => {
+    if (workersRef.current > 0 || queueRef.current.length > 0 || !runningRef.current) return;
+    const ok = okRef.current;
+    const failed = failedRef.current;
+    if (resumeOnActive.current && failed > 0) {
+      failedRef.current = 0;
       return;
     }
-    const allowed = await ensureAlbumPermission();
-    if (!allowed) return;
-    setBusy(true);
-    const ids = new Set(pending.map((row) => row.id));
-    setRows((prev) =>
-      prev.map((row) => (ids.has(row.id) ? { ...row, phase: 'parse', message: '等待下载', progress: 0.02 } : row)),
-    );
-    let chain = Promise.resolve();
-    const flipOne = (local: string, id: string) => {
-      const task = chain.then(async () => {
-        patch(id, { phase: 'flip', message: '正在翻转', progress: 0 });
-        return VideoFlip.flipHorizontal(local, { jobId: id });
-      });
-      chain = task.then(
-        () => undefined,
-        () => undefined,
-      );
-      return task;
-    };
-    const queue = [...pending];
-    let ok = 0;
-    let failed = 0;
-    const worker = async () => {
-      while (queue.length > 0) {
-        const row = queue.shift();
-        if (!row) return;
-        const locals: string[] = [];
-        let usedFlip = false;
-        try {
-          const kind = platformOf(row.link);
-          if (!kind) throw new Error('请粘贴公开的视频链接');
-          patch(row.id, { phase: 'parse', message: '正在解析', progress: 0.04 });
-          const files = await parseLink(kind, row.link);
-          if (files.length === 0) throw new Error('没有解析到可以保存的视频');
-          for (let index = 0; index < files.length; index += 1) {
-            const job = files[index];
-            const referer = refererFor(kind, row.link);
-            patch(row.id, {
-              phase: 'download',
-              message: files.length > 1 ? `正在下载 ${index + 1}/${files.length}` : '正在下载',
-              progress: 0,
-            });
-            const local = await fetchSavedFile(job, referer, row.id);
-            locals.push(local);
-            let output = local;
-            if (flipOn && !isStillImage(local)) {
-              patch(row.id, { phase: 'flip', message: '等待翻转', progress: 0 });
-              output = await flipOne(local, row.id);
-              usedFlip = true;
-              if (output !== local) locals.push(output);
-            }
-            patch(row.id, {
-              phase: 'save',
-              message: files.length > 1 ? `正在保存 ${index + 1}/${files.length}` : '正在保存到相册',
-              progress: 0.98,
-            });
-            await MediaLibrary.createAssetAsync(output);
-          }
-          ok += 1;
-          patch(row.id, {
-            phase: 'done',
-            message: usedFlip ? '已翻转并保存到相册' : '已保存到相册',
-            progress: 1,
-          });
-        } catch (error) {
-          failed += 1;
-          patch(row.id, { phase: 'error', message: friendly(errorText(error)), progress: 0 });
-        } finally {
-          locals.forEach((uri) => VideoFlip.removeTempFile(uri));
-        }
-      }
-    };
-    try {
-      VideoFlip.holdBackground();
-      if (flipOn) VideoFlip.prepareFlipBatch();
-      const width = Math.min(3, queue.length);
-      await Promise.all(Array.from({ length: width }, () => worker()));
-      if (failed === 0) {
-        Alert.alert('已保存', ok > 1 ? `已保存 ${ok} 条到 iPhone 相册。` : '已保存到 iPhone 相册。');
-      } else if (ok === 0) {
-        Alert.alert('没有保存', '这几条都没有保存成功，看每条下面的说明。');
-      } else {
-        Alert.alert('保存了一部分', `成功 ${ok} 条，失败 ${failed} 条。失败的可以再点保存。`);
-      }
-    } catch (error) {
-      const message = friendly(errorText(error));
-      setRows((prev) =>
-        prev.map((row) =>
-          ids.has(row.id) && row.phase !== 'done' && row.phase !== 'error'
-            ? { ...row, phase: 'error', message, progress: 0 }
-            : row,
-        ),
-      );
-    } finally {
+    runningRef.current = false;
+    if (heldRef.current) {
+      heldRef.current = false;
       VideoFlip.releaseBackground();
-      setBusy(false);
+    }
+    setBusy(false);
+    okRef.current = 0;
+    failedRef.current = 0;
+    if (ok === 0 && failed === 0) return;
+    if (failed === 0) {
+      Alert.alert('已保存', ok > 1 ? `已保存 ${ok} 条到 iPhone 相册。` : '已保存到 iPhone 相册。');
+    } else if (ok === 0) {
+      Alert.alert('没有保存', '这几条都没有保存成功，看每条下面的说明。');
+    } else {
+      Alert.alert('保存了一部分', `成功 ${ok} 条，失败 ${failed} 条。失败的可以单独点重试。`);
     }
   };
+
+  const runRow = async (row: Row) => {
+    const locals: string[] = [];
+    let usedFlip = false;
+    try {
+      const kind = platformOf(row.link);
+      if (!kind) throw new Error('请粘贴公开的视频链接');
+      patch(row.id, { phase: 'parse', message: '正在解析', progress: 0.04 });
+      const parsed = await parseLink(kind, row.link);
+      if (dropped.current.has(row.id)) return;
+      if (parsed.cover) rememberPreview(row.id, parsed.cover);
+      const files = parsed.jobs;
+      if (files.length === 0) throw new Error('没有解析到可以保存的视频');
+      for (let index = 0; index < files.length; index += 1) {
+        if (dropped.current.has(row.id)) return;
+        const job = files[index];
+        const referer = refererFor(kind, row.link);
+        patch(row.id, {
+          phase: 'download',
+          message: files.length > 1 ? `正在下载 ${index + 1}/${files.length}` : '正在下载',
+          progress: 0,
+        });
+        const local = await fetchSavedFile(job, referer, row.id);
+        if (dropped.current.has(row.id)) {
+          VideoFlip.removeTempFile(local);
+          return;
+        }
+        locals.push(local);
+        if (isStillImage(local)) {
+          rememberPreview(row.id, local);
+        } else {
+          try {
+            const frame = await VideoFlip.frameAt(local, 0.15);
+            if (dropped.current.has(row.id)) {
+              VideoFlip.removeTempFile(frame);
+              return;
+            }
+            rememberPreview(row.id, frame);
+          } catch {
+            // 抽不到画面时继续用封面。
+          }
+        }
+        let output = local;
+        if (flipOnRef.current && !isStillImage(local)) {
+          patch(row.id, { phase: 'flip', message: '等待翻转', progress: 0 });
+          const task = flipChain.current.then(async () => {
+            if (dropped.current.has(row.id)) throw new Error('已删除');
+            patch(row.id, { phase: 'flip', message: '正在翻转', progress: 0 });
+            return VideoFlip.flipHorizontal(local, { jobId: row.id });
+          });
+          flipChain.current = task.then(
+            () => undefined,
+            () => undefined,
+          );
+          output = await task;
+          if (dropped.current.has(row.id)) return;
+          usedFlip = true;
+          if (output !== local) locals.push(output);
+          try {
+            const frame = await VideoFlip.frameAt(output, 0.15);
+            if (!dropped.current.has(row.id)) rememberPreview(row.id, frame);
+            else VideoFlip.removeTempFile(frame);
+          } catch {
+            // 翻转后的画面抽不出来时，保留下载时的画面。
+          }
+        }
+        if (dropped.current.has(row.id)) return;
+        patch(row.id, {
+          phase: 'save',
+          message: files.length > 1 ? `正在保存 ${index + 1}/${files.length}` : '正在保存到相册',
+          progress: 0.98,
+        });
+        await MediaLibrary.createAssetAsync(output);
+      }
+      okRef.current += 1;
+      patch(row.id, {
+        phase: 'done',
+        message: usedFlip ? '已翻转并保存到相册' : '已保存到相册',
+        progress: 1,
+      });
+    } catch (error) {
+      if (dropped.current.has(row.id)) return;
+      failedRef.current += 1;
+      if (resumeOnActive.current) interruptedRef.current.add(row.id);
+      patch(row.id, {
+        phase: 'error',
+        message: resumeOnActive.current ? '切走后中断了，回到后会继续' : friendly(errorText(error)),
+        progress: 0,
+      });
+    } finally {
+      queuedIds.current.delete(row.id);
+      const keep = previewRef.current.get(row.id) || '';
+      locals.forEach((uri) => {
+        if (uri !== keep) VideoFlip.removeTempFile(uri);
+      });
+    }
+  };
+
+  const pump = () => {
+    while (workersRef.current < CONCURRENCY && queueRef.current.length > 0) {
+      const row = queueRef.current.shift();
+      if (!row) break;
+      workersRef.current += 1;
+      void runRow(row).finally(() => {
+        workersRef.current -= 1;
+        pump();
+        finishIfIdle();
+      });
+    }
+  };
+
+  const startRows = async (ids: string[]) => {
+    while (savingLock.current) {
+      await new Promise((resolve) => setTimeout(resolve, 40));
+    }
+    const pending = rowsRef.current.filter(
+      (row) => ids.includes(row.id) && (row.phase === 'ready' || row.phase === 'error' || interruptedRef.current.has(row.id)) && !queuedIds.current.has(row.id),
+    );
+    if (pending.length === 0) return;
+    pending.forEach((row) => {
+      dropped.current.delete(row.id);
+      queuedIds.current.add(row.id);
+    });
+    savingLock.current = true;
+    try {
+      const allowed = await ensureAlbumPermission();
+      if (!allowed) {
+        pending.forEach((row) => queuedIds.current.delete(row.id));
+        return;
+      }
+      const still = pending.filter((row) => queuedIds.current.has(row.id));
+      if (still.length === 0) return;
+      still.forEach((row) => interruptedRef.current.delete(row.id));
+      if (!runningRef.current) {
+        VideoFlip.holdBackground();
+        heldRef.current = true;
+        try {
+          VideoFlip.prepareFlipBatch();
+        } catch (error) {
+          still.forEach((row) => queuedIds.current.delete(row.id));
+          heldRef.current = false;
+          VideoFlip.releaseBackground();
+          const message = friendly(errorText(error));
+          const ids = new Set(still.map((row) => row.id));
+          setRows((prev) => prev.map((row) => (ids.has(row.id) ? { ...row, phase: 'error', message, progress: 0 } : row)));
+          return;
+        }
+      }
+      const ids = new Set(still.map((row) => row.id));
+      setRows((prev) =>
+        prev.map((row) => (ids.has(row.id) ? { ...row, phase: 'parse', message: '等待下载', progress: 0.02 } : row)),
+      );
+      queueRef.current.push(...still);
+      runningRef.current = true;
+      setBusy(true);
+      pump();
+    } finally {
+      savingLock.current = false;
+    }
+  };
+
+  const save = () => {
+    const pending = rows.filter((row) => (row.phase === 'ready' || row.phase === 'error') && !queuedIds.current.has(row.id));
+    if (pending.length === 0) {
+      Alert.alert('没有要保存的链接', runningRef.current ? '新链接点粘贴或 + 加到列表后，再点保存。失败的可以点这一条上的重试。' : '先点粘贴或 + 把链接加到列表里，再点保存。');
+      return;
+    }
+    void startRows(pending.map((row) => row.id));
+  };
+
+  const retry = (row: Row) => {
+    void startRows([row.id]);
+  };
+
+  startRowsRef.current = startRows;
+  pumpRef.current = pump;
+
+  useEffect(() => {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    let tries = 0;
+    const sub = AppState.addEventListener('change', (next) => {
+      if (next === 'inactive' || next === 'background') {
+        if (runningRef.current || workersRef.current > 0 || queueRef.current.length > 0) {
+          resumeOnActive.current = true;
+        }
+        return;
+      }
+      if (next !== 'active' || !resumeOnActive.current) return;
+      if (timer) clearTimeout(timer);
+      tries = 0;
+      const tick = () => {
+        tries += 1;
+        if (queueRef.current.length > 0 && workersRef.current < CONCURRENCY) {
+          runningRef.current = true;
+          pumpRef.current();
+        }
+        const busy = workersRef.current > 0 || queueRef.current.length > 0;
+        const failedIds = rowsRef.current
+          .filter((row) => (row.phase === 'error' || interruptedRef.current.has(row.id)) && row.phase !== 'done' && !queuedIds.current.has(row.id))
+          .map((row) => row.id);
+        if (failedIds.length > 0 && !busy) {
+          resumeOnActive.current = false;
+          void startRowsRef.current(failedIds);
+          return;
+        }
+        if (!busy && failedIds.length === 0) {
+          if (tries < 3) {
+            timer = setTimeout(tick, 400);
+            return;
+          }
+          resumeOnActive.current = false;
+          return;
+        }
+        if (tries < 8) {
+          timer = setTimeout(tick, 400);
+          return;
+        }
+        resumeOnActive.current = false;
+        if (failedIds.length > 0) void startRowsRef.current(failedIds);
+      };
+      timer = setTimeout(tick, 400);
+    });
+    return () => {
+      if (timer) clearTimeout(timer);
+      sub.remove();
+    };
+  }, []);
 
   return (
     <View style={[styles.screen, { paddingTop: insets.top + 8, backgroundColor: palette.background }]}>
@@ -247,14 +545,10 @@ export function SaveLinkScreen({ onBack }: { onBack?: () => void }) {
           <Text style={[styles.back, { color }]}>返回</Text>
         </Pressable>
       ) : null}
-      <Text style={[styles.title, { color: palette.text }]}>解析短视频</Text>
-      <Text style={[styles.subtitle, { color: palette.muted }]}>
-        支持抖音、快手、视频号、Threads、X，以及 Instagram、TikTok 的公开视频。复制一条后点「粘贴」，再加下一条就点「+」。相同链接会自动去掉。点「保存」后可以切去别的 App，下载会继续，完成后进入相册。
-      </Text>
+      <Text style={[styles.title, { color: palette.text }]}>video</Text>
       <TextInput
         value={draft}
         onChangeText={setDraft}
-        editable={!busy}
         autoCapitalize="none"
         autoCorrect={false}
         placeholder="也可以在这里输入一条链接"
@@ -262,64 +556,82 @@ export function SaveLinkScreen({ onBack }: { onBack?: () => void }) {
         style={[styles.input, { color: palette.text, backgroundColor: palette.card, borderColor: palette.line }]}
       />
       <View style={styles.actions}>
-        <Pressable style={[styles.small, { backgroundColor: color, opacity: busy ? 0.6 : 1 }]} disabled={busy} onPress={paste}>
-          <Text style={styles.buttonText}>粘贴</Text>
-        </Pressable>
-        <Pressable
-          style={[styles.plus, { borderColor: color, opacity: busy ? 0.6 : 1 }]}
-          disabled={busy}
-          onPress={paste}
-        >
-          <Text style={[styles.plusText, { color }]}>+</Text>
-        </Pressable>
-        <Pressable
-          style={[styles.small, styles.plain, { borderColor: palette.line, opacity: busy ? 0.6 : 1 }]}
-          disabled={busy}
-          onPress={() => addLink(draft, false)}
-        >
+        <LinkPasteButton icon={false} background={color} foreground="#FFFFFF" onPaste={(event) => pasteText(event, true)} style={styles.pasteWide} />
+        <View style={[styles.pastePlus, { backgroundColor: color }]}>
+          <LinkPasteButton
+            icon
+            background={color}
+            foreground={color}
+            onPaste={(event) => pasteText(event, true)}
+            style={styles.pastePlusFill}
+          />
+          <View pointerEvents="none" style={[styles.pastePlusFill, styles.plusCover, { backgroundColor: color }]}>
+            <Text style={styles.plusText}>+</Text>
+          </View>
+        </View>
+        <Pressable style={[styles.small, styles.plain, { borderColor: palette.line }]} onPress={() => addLink(draft, false)}>
           <Text style={[styles.plainText, { color: palette.text }]}>加入</Text>
         </Pressable>
       </View>
-      <Pressable style={styles.checkRow} disabled={busy} onPress={() => setFlipOn((value) => !value)}>
+      <Pressable style={styles.checkRow} onPress={() => setFlipOn((value) => !value)}>
         <View style={[styles.box, { borderColor: color }, flipOn && { backgroundColor: color }]}>
           {flipOn ? <Text style={styles.tick}>✓</Text> : null}
         </View>
         <Text style={[styles.checkText, { color: palette.text }]}>批量翻转</Text>
         <Text style={[styles.checkHint, { color: palette.muted }]}>保存时自动翻转后再进相册</Text>
       </Pressable>
+      <View style={styles.listHead}>
+        <Text style={[styles.listCount, { color: palette.muted }]}>
+          {rows.length === 0 ? '链接列表' : `链接列表 ${rows.length}`}
+        </Text>
+        <Pressable onPress={clearList} hitSlop={8}>
+          <Text style={[styles.clearText, { color: rows.length === 0 ? palette.line : '#C2410C' }]}>清空列表</Text>
+        </Pressable>
+      </View>
       <ScrollView style={styles.list} contentContainerStyle={styles.listContent} keyboardShouldPersistTaps="handled">
         {rows.length === 0 ? (
-          <Text style={[styles.empty, { color: palette.muted }]}>还没有链接。点粘贴加入一条，点 + 再加入下一条。</Text>
+          <Text style={[styles.empty, { color: palette.muted }]}>还没有链接。点「粘贴」或 + 可一次加入多行，一行一条。</Text>
         ) : (
           rows.map((row, index) => (
             <View key={row.id} style={[styles.card, { backgroundColor: palette.card, borderColor: palette.line }]}>
-              <View style={styles.cardTop}>
-                <Text style={[styles.index, { color }]}>{index + 1}</Text>
-                <Text style={[styles.link, { color: palette.text }]} numberOfLines={2}>
-                  {row.link}
-                </Text>
-                {row.phase === 'ready' || row.phase === 'error' || row.phase === 'done' ? (
-                  <Pressable hitSlop={8} disabled={busy} onPress={() => removeRow(row)}>
-                    <Text style={[styles.remove, { color: palette.muted }]}>删除</Text>
+              <Pressable style={styles.cardHit} onPress={() => removeRow(row)}>
+                <RowPreview row={row} line={palette.line} muted={palette.muted} />
+                <View style={styles.cardBody}>
+                  <View style={styles.cardTop}>
+                    <Text style={[styles.index, { color }]}>{index + 1}</Text>
+                    <Pressable style={styles.linkHit} onPress={() => void openInApp(row.link)}>
+                      <Text style={[styles.link, styles.linkOpen, { color: palette.text }]} numberOfLines={2}>
+                        {row.link}
+                      </Text>
+                    </Pressable>
+                  </View>
+                  <View style={[styles.track, { backgroundColor: palette.line }]}>
+                    <View style={[styles.fill, { width: `${Math.round(row.progress * 100)}%`, backgroundColor: color }]} />
+                  </View>
+                  <Text style={[styles.status, { color: row.phase === 'error' ? '#C2410C' : palette.muted }]} numberOfLines={2}>
+                    {row.message}
+                  </Text>
+                </View>
+              </Pressable>
+              <View style={styles.rowActions}>
+                <Pressable hitSlop={8} onPress={() => copyRow(row)}>
+                  <Text style={[styles.remove, { color }]}>{copiedId === row.id ? '已复制' : '复制'}</Text>
+                </Pressable>
+                {row.phase === 'error' ? (
+                  <Pressable hitSlop={8} onPress={() => retry(row)}>
+                    <Text style={[styles.remove, { color }]}>重试</Text>
                   </Pressable>
                 ) : null}
+                <Pressable hitSlop={8} onPress={() => removeRow(row)}>
+                  <Text style={[styles.remove, { color: palette.muted }]}>删除</Text>
+                </Pressable>
               </View>
-              <View style={[styles.track, { backgroundColor: palette.line }]}>
-                <View style={[styles.fill, { width: `${Math.round(row.progress * 100)}%`, backgroundColor: color }]} />
-              </View>
-              <Text style={[styles.status, { color: row.phase === 'error' ? '#C2410C' : palette.muted }]} numberOfLines={2}>
-                {row.message}
-              </Text>
             </View>
           ))
         )}
       </ScrollView>
-      <Pressable
-        style={[styles.button, { backgroundColor: color, opacity: busy ? 0.7 : 1 }]}
-        disabled={busy}
-        onPress={() => void save()}
-      >
-        {busy ? <ActivityIndicator color="#FFFFFF" /> : <Text style={styles.buttonText}>保存</Text>}
+      <Pressable style={[styles.button, { backgroundColor: color }]} onPress={() => void save()}>
+        <Text style={styles.buttonText}>保存</Text>
       </Pressable>
     </View>
   );
@@ -336,6 +648,16 @@ async function ensureAlbumPermission() {
   return false;
 }
 
+function findLinks(text: string) {
+  const lines = text.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
+  const found: string[] = [];
+  for (const line of lines.length > 0 ? lines : [text]) {
+    const link = findLink(line);
+    if (link && !found.includes(link)) found.push(link);
+  }
+  return found;
+}
+
 function findLink(text: string) {
   const match = text.match(/https?:\/\/[^\s<>"']+/i);
   if (!match) return '';
@@ -343,6 +665,56 @@ function findLink(text: string) {
     .replace(/[\u200b\u200c\u200d\ufeff]/g, '')
     .replace(/[\u4e00-\u9fff\u3000-\u303f\uff00-\uffef].*$/g, '')
     .replace(/[，。；;、,）)\]】》>"']+$/g, '');
+}
+
+async function openInApp(link: string) {
+  const native = nativePlayUrl(link);
+  if (native) {
+    try {
+      if (await Linking.canOpenURL(native)) {
+        await Linking.openURL(native);
+        return;
+      }
+    } catch {
+      // 没有装对应 App 时，改开原来的链接。
+    }
+  }
+  try {
+    await Linking.openURL(link);
+  } catch {
+    Alert.alert('没有打开', '这条链接没能打开对应的 App。');
+  }
+}
+
+function nativePlayUrl(link: string) {
+  try {
+    const url = new URL(link);
+    const host = url.hostname.toLowerCase();
+    const path = url.pathname;
+    if (host.includes('douyin.com') || host.includes('iesdouyin.com')) {
+      const id = /\/(?:video|note)\/(\d+)/.exec(path)?.[1] || '';
+      return id ? `snssdk1128://aweme/detail/${id}` : '';
+    }
+    if (host === 'tiktok.com' || host.endsWith('.tiktok.com')) {
+      const id = /\/video\/(\d+)/.exec(path)?.[1] || '';
+      return id ? `snssdk1233://aweme/detail/${id}` : '';
+    }
+    if (host.includes('kuaishou.com') || host.includes('chenzhongtech.com') || host.includes('gifshow.com')) {
+      const id = /\/(?:short-video|fw\/photo|photo)\/([A-Za-z0-9_-]+)/.exec(path)?.[1] || '';
+      return id ? `kwai://work/${id}` : '';
+    }
+    if (host === 'x.com' || host.endsWith('.x.com') || host === 'twitter.com' || host.endsWith('.twitter.com')) {
+      const id = /\/status\/(\d+)/.exec(path)?.[1] || '';
+      return id ? `twitter://status?id=${id}` : '';
+    }
+    if (host.includes('threads.net') || host.includes('threads.com')) {
+      const code = /\/post\/([A-Za-z0-9_-]+)/.exec(path)?.[1] || '';
+      return code ? `barcelona://www.threads.net${path}` : '';
+    }
+    return '';
+  } catch {
+    return '';
+  }
 }
 
 function platformOf(url: string) {
@@ -428,9 +800,11 @@ async function parseKuku(link: string) {
   if (parsed.status !== 0 || !parsed.data || typeof parsed.data !== 'object') {
     throw new Error(parsed.message || '这条链接没有解析出来');
   }
-  const jobs = chooseKuku(parsed.data as KukuData);
+  const data = parsed.data as KukuData;
+  const jobs = chooseKuku(data);
   if (jobs.length === 0) throw new Error(parsed.message || '没有解析到可以保存的视频');
-  return jobs;
+  const cover = data.cover && data.cover.startsWith('http') ? data.cover : '';
+  return { jobs, cover };
 }
 
 const MAX_FILE_BYTES = 80_000_000;
@@ -498,7 +872,7 @@ async function parseInstagram(link: string) {
     throw new Error(parsed.message || '这条链接没有解析出来');
   }
   const html = typeof parsed.data === 'string' ? parsed.data : '';
-  return chooseInstagram(html);
+  return { jobs: chooseInstagram(html), cover: coverIn(html, 'https://insget.net/') };
 }
 
 async function parseTikTok(link: string) {
@@ -509,7 +883,7 @@ async function parseTikTok(link: string) {
     const message = /class="tk-error"[^>]*>([^<]+)/.exec(html)?.[1]?.trim();
     throw new Error(message || '这条链接没有解析出来');
   }
-  return files;
+  return { jobs: files, cover: coverIn(html, 'https://tiktokio.com/') };
 }
 
 async function parseThreads(link: string) {
@@ -524,7 +898,7 @@ async function parseThreads(link: string) {
   if (jobs.length === 0) {
     throw new Error(/couldn.?t find any videos|not__found/i.test(html) ? '这条帖子里没有可以保存的视频' : '这条链接没有解析出来');
   }
-  return jobs;
+  return { jobs, cover: coverIn(html, 'https://threadster.app/') };
 }
 
 function chooseThreads(html: string): SaveJob[] {
@@ -550,7 +924,7 @@ async function parseTwitter(link: string) {
   const html = typeof parsed.data === 'string' ? parsed.data : '';
   const jobs = parsed.status === 'ok' && !parsed.msg ? chooseTwitter(html) : [];
   if (jobs.length === 0) throw new Error(twitterMessage(parsed.msg || ''));
-  return jobs;
+  return { jobs, cover: coverIn(html, 'https://savetwitter.net/') };
 }
 
 function chooseTwitter(html: string): SaveJob[] {
@@ -665,6 +1039,15 @@ function isFile(url: string) {
   return /\.(mp4|mov|m4v|jpg|jpeg|png|webp)(\?|$)/i.test(url) || /\/download(\?|$)/i.test(url);
 }
 
+function coverIn(html: string, base: string) {
+  const og = /property=["']og:image["'][^>]*content=["']([^"']+)["']/i.exec(html)?.[1]
+    || /content=["']([^"']+)["'][^>]*property=["']og:image["']/i.exec(html)?.[1]
+    || /poster=["']([^"']+)["']/i.exec(html)?.[1]
+    || '';
+  const url = absolute(decodeHtml(og), base);
+  return /^https?:\/\//i.test(url) ? url : '';
+}
+
 function absolute(href: string, base: string) {
   if (!href || href.startsWith('javascript:') || href.startsWith('#')) return '';
   try {
@@ -690,6 +1073,27 @@ function isStillImage(uri: string) {
   return /\.(jpg|jpeg|png|webp)(\?|$)/i.test(uri.split('?')[0]);
 }
 
+function phaseWord(phase: RowPhase) {
+  if (phase === 'parse') return '解析中';
+  if (phase === 'download') return '下载中';
+  if (phase === 'flip') return '翻转中';
+  if (phase === 'save') return '保存中';
+  return '';
+}
+
+function RowPreview({ row, line, muted }: { row: Row; line: string; muted: string }) {
+  const active = row.phase === 'parse' || row.phase === 'download' || row.phase === 'flip' || row.phase === 'save';
+  if (!row.preview && !active) return null;
+  if (!row.preview) {
+    return (
+      <View style={[styles.preview, { backgroundColor: line }]}>
+        <Text style={[styles.previewText, { color: muted }]}>{phaseWord(row.phase)}</Text>
+      </View>
+    );
+  }
+  return <Image source={{ uri: row.preview }} style={styles.preview} />;
+}
+
 function friendly(message: string) {
   if (/unable to fetch|paste correct link|0x02/i.test(message)) {
     return '这条链接没有解析出来。请确认复制的是公开视频链接，然后再试一次。';
@@ -711,12 +1115,7 @@ const styles = StyleSheet.create({
   title: {
     fontSize: 28,
     fontWeight: '800',
-  },
-  subtitle: {
-    marginTop: 8,
     marginBottom: 16,
-    fontSize: 14,
-    lineHeight: 20,
   },
   input: {
     minHeight: 48,
@@ -739,6 +1138,27 @@ const styles = StyleSheet.create({
     justifyContent: 'center',
     paddingHorizontal: 16,
   },
+  pasteWide: {
+    width: 88,
+    height: 44,
+  },
+  pastePlus: {
+    width: 44,
+    height: 44,
+    borderRadius: 12,
+    overflow: 'hidden',
+  },
+  pastePlusFill: {
+    position: 'absolute',
+    top: 0,
+    right: 0,
+    bottom: 0,
+    left: 0,
+  },
+  plusCover: {
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
   plus: {
     width: 44,
     height: 44,
@@ -758,6 +1178,20 @@ const styles = StyleSheet.create({
   },
   plainText: {
     fontSize: 16,
+    fontWeight: '800',
+  },
+  listHead: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    marginTop: 16,
+  },
+  listCount: {
+    fontSize: 13,
+    fontWeight: '700',
+  },
+  clearText: {
+    fontSize: 14,
     fontWeight: '800',
   },
   checkRow: {
@@ -789,7 +1223,7 @@ const styles = StyleSheet.create({
   },
   list: {
     flex: 1,
-    marginTop: 12,
+    marginTop: 8,
   },
   listContent: {
     paddingBottom: 8,
@@ -804,6 +1238,35 @@ const styles = StyleSheet.create({
     borderWidth: StyleSheet.hairlineWidth,
     padding: 12,
   },
+  cardHit: {
+    flexDirection: 'row',
+    alignItems: 'flex-start',
+    gap: 10,
+  },
+  cardBody: {
+    flex: 1,
+  },
+  preview: {
+    width: 72,
+    height: 96,
+    borderRadius: 8,
+    overflow: 'hidden',
+  },
+  previewText: {
+    flex: 1,
+    textAlign: 'center',
+    textAlignVertical: 'center',
+    fontSize: 12,
+    fontWeight: '700',
+    lineHeight: 96,
+  },
+  rowActions: {
+    flexDirection: 'row',
+    justifyContent: 'flex-end',
+    alignItems: 'center',
+    gap: 16,
+    marginTop: 8,
+  },
   cardTop: {
     flexDirection: 'row',
     alignItems: 'flex-start',
@@ -813,10 +1276,16 @@ const styles = StyleSheet.create({
     fontSize: 15,
     fontWeight: '800',
   },
+  linkHit: {
+    flex: 1,
+  },
   link: {
     flex: 1,
     fontSize: 13,
     lineHeight: 18,
+  },
+  linkOpen: {
+    textDecorationLine: 'underline',
   },
   remove: {
     fontSize: 13,

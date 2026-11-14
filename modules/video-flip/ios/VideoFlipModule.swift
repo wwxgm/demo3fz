@@ -29,6 +29,19 @@ public class VideoFlipModule: Module {
   public func definition() -> ModuleDefinition {
     Name("VideoFlip")
 
+    View(LinkPasteButton.self) {
+      Prop("icon") { (view: LinkPasteButton, icon: Bool) in
+        view.update(icon: icon)
+      }
+      Prop("background") { (view: LinkPasteButton, color: UIColor) in
+        view.update(background: color)
+      }
+      Prop("foreground") { (view: LinkPasteButton, color: UIColor) in
+        view.update(foreground: color)
+      }
+      Events("onPaste")
+    }
+
     Function("prepareFlipBatch") {
       FlipControl.reset()
     }
@@ -134,6 +147,21 @@ public class VideoFlipModule: Module {
         text = UIPasteboard.general.string ?? ""
       }
       return text
+    }
+
+    Function("copyText") { (text: String) in
+      let write = {
+        UIPasteboard.general.string = text
+      }
+      if Thread.isMainThread {
+        write()
+      } else {
+        DispatchQueue.main.sync(execute: write)
+      }
+    }
+
+    Function("cancelDownload") { (id: String) in
+      DownloadHub.shared.cancel(id)
     }
 
     Function("sealKuku") { (plain: String, authKey: String, authSeed: String) throws -> [String: String] in
@@ -398,40 +426,56 @@ private enum BackgroundKeep {
   static func release() {
     lock.lock()
     wants = max(0, wants - 1)
-    let id = wants == 0 ? token : UIBackgroundTaskIdentifier.invalid
-    if wants == 0 {
-      token = .invalid
-    }
+    let ending = wants == 0
     lock.unlock()
-    if id != .invalid {
-      UIApplication.shared.endBackgroundTask(id)
-    }
-  }
-
-  static func ensure() {
-    lock.lock()
-    let needed = wants > 0 && token == .invalid
-    lock.unlock()
-    guard needed else { return }
-    var created: UIBackgroundTaskIdentifier = .invalid
-    created = UIApplication.shared.beginBackgroundTask(withName: "save-link") {
+    guard ending else { return }
+    onMain {
       lock.lock()
-      let id = token
-      token = .invalid
+      let id = wants == 0 ? token : UIBackgroundTaskIdentifier.invalid
+      if wants == 0 {
+        token = .invalid
+      }
       lock.unlock()
       if id != .invalid {
         UIApplication.shared.endBackgroundTask(id)
       }
     }
-    lock.lock()
-    if wants > 0 && token == .invalid && created != .invalid {
-      token = created
+  }
+
+  static func ensure() {
+    onMain {
+      lock.lock()
+      let needed = wants > 0 && token == .invalid
       lock.unlock()
-    } else {
-      lock.unlock()
-      if created != .invalid {
-        UIApplication.shared.endBackgroundTask(created)
+      guard needed else { return }
+      var created: UIBackgroundTaskIdentifier = .invalid
+      created = UIApplication.shared.beginBackgroundTask(withName: "save-link") {
+        lock.lock()
+        let id = token
+        token = .invalid
+        lock.unlock()
+        if id != .invalid {
+          UIApplication.shared.endBackgroundTask(id)
+        }
       }
+      lock.lock()
+      if wants > 0 && token == .invalid && created != .invalid {
+        token = created
+        lock.unlock()
+      } else {
+        lock.unlock()
+        if created != .invalid {
+          UIApplication.shared.endBackgroundTask(created)
+        }
+      }
+    }
+  }
+
+  private static func onMain(_ work: @escaping () -> Void) {
+    if Thread.isMainThread {
+      work()
+    } else {
+      DispatchQueue.main.async(execute: work)
     }
   }
 }
@@ -461,6 +505,7 @@ private final class DownloadHub: NSObject, URLSessionDownloadDelegate {
   private let lock = NSLock()
   private var progressMap: [String: Double] = [:]
   private var slots: [ObjectIdentifier: Slot] = [:]
+  private var tasks: [String: URLSessionTask] = [:]
   private var backgroundCompletion: (() -> Void)?
   private lazy var session: URLSession = makeSession(background: true)
   private lazy var postedSession: URLSession = makeSession(background: false)
@@ -489,37 +534,42 @@ private final class DownloadHub: NSObject, URLSessionDownloadDelegate {
     return value
   }
 
+  func cancel(_ id: String) {
+    guard !id.isEmpty else { return }
+    lock.lock()
+    let task = tasks.removeValue(forKey: id)
+    progressMap[id] = 0
+    lock.unlock()
+    task?.cancel()
+  }
+
   func handleBackgroundEvents(identifier: String, completionHandler: @escaping () -> Void) {
     guard identifier == DownloadHub.identifier else { return }
     _ = session
     lock.lock()
     backgroundCompletion = completionHandler
     lock.unlock()
+    DispatchQueue.main.async { [weak self] in
+      self?.finishBackgroundEvents()
+    }
+  }
+
+  func finishBackgroundEvents() {
+    if !Thread.isMainThread {
+      DispatchQueue.main.async { [weak self] in
+        self?.finishBackgroundEvents()
+      }
+      return
+    }
+    lock.lock()
+    let handler = backgroundCompletion
+    backgroundCompletion = nil
+    lock.unlock()
+    handler?()
   }
 
   func fetch(url: String, body: String, contentType: String, referer: String, jobId: String) async throws -> (file: URL, response: HTTPURLResponse) {
-    let background = body.isEmpty && !Self.appIsActive()
-    do {
-      return try await transfer(url: url, body: body, contentType: contentType, referer: referer, jobId: jobId, background: background)
-    } catch let error as PageLoadError {
-      guard background, error.errorDescription == "视频没有下载下来" else { throw error }
-    } catch {
-      guard background else { throw error }
-    }
-    await Self.leaveSessionQueue()
-    return try await transfer(url: url, body: body, contentType: contentType, referer: referer, jobId: jobId, background: false)
-  }
-
-  private static func appIsActive() -> Bool {
-    UIApplication.shared.applicationState == .active
-  }
-
-  private static func leaveSessionQueue() async {
-    await withCheckedContinuation { (done: CheckedContinuation<Void, Never>) in
-      DispatchQueue.global(qos: .userInitiated).async {
-        done.resume()
-      }
-    }
+    try await transfer(url: url, body: body, contentType: contentType, referer: referer, jobId: jobId, background: false)
   }
 
   private func transfer(
@@ -564,6 +614,9 @@ private final class DownloadHub: NSObject, URLSessionDownloadDelegate {
       slot.continuation = continuation
       lock.lock()
       slots[slotKey(task)] = slot
+      if !jobId.isEmpty {
+        tasks[jobId] = task
+      }
       lock.unlock()
       task.resume()
     }
@@ -625,9 +678,12 @@ private final class DownloadHub: NSObject, URLSessionDownloadDelegate {
     BackgroundKeep.ensure()
     lock.lock()
     let slot = slots.removeValue(forKey: slotKey(task))
+    if let id = task.taskDescription, !id.isEmpty {
+      tasks.removeValue(forKey: id)
+    }
     lock.unlock()
     guard let slot else { return }
-    if let error {
+    if error != nil {
       if let file = slot.file {
         try? FileManager.default.removeItem(at: file)
       }
@@ -646,25 +702,22 @@ private final class DownloadHub: NSObject, URLSessionDownloadDelegate {
   }
 
   func urlSessionDidFinishEvents(forBackgroundURLSession session: URLSession) {
-    lock.lock()
-    let handler = backgroundCompletion
-    backgroundCompletion = nil
-    lock.unlock()
-    guard let handler else { return }
-    DispatchQueue.main.async {
-      handler()
-    }
+    finishBackgroundEvents()
   }
 }
 
 @objc(SaveLinkBackground)
-public class SaveLinkBackground: NSObject, ExpoAppDelegateSubscriber {
+public class SaveLinkBackground: ExpoAppDelegateSubscriber {
   public func application(
     _ application: UIApplication,
     handleEventsForBackgroundURLSession identifier: String,
     completionHandler: @escaping () -> Void
   ) {
     DownloadHub.shared.handleBackgroundEvents(identifier: identifier, completionHandler: completionHandler)
+  }
+
+  public func applicationDidBecomeActive(_ application: UIApplication) {
+    DownloadHub.shared.finishBackgroundEvents()
   }
 }
 

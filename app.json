@@ -20,7 +20,17 @@
         "CFBundleDisplayName": "视频翻转",
         "NSPhotoLibraryUsageDescription": "需要访问相册，以选择图片或视频，并把处理后的文件保存到相册。",
         "NSPhotoLibraryAddUsageDescription": "需要把处理后的图片和视频保存到你的手机相册。",
-        "ITSAppUsesNonExemptEncryption": false
+        "ITSAppUsesNonExemptEncryption": false,
+        "LSApplicationQueriesSchemes": [
+          "instagram",
+          "snssdk1233",
+          "snssdk1128",
+          "kwai",
+          "gifshow",
+          "twitter",
+          "barcelona",
+          "weixin"
+        ]
       }
     },
     "android": {

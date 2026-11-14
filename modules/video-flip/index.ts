@@ -1,4 +1,5 @@
-import { requireNativeModule } from 'expo-modules-core';
+import { requireNativeModule, requireNativeViewManager } from 'expo-modules-core';
+import type { StyleProp, ViewStyle } from 'react-native';
 
 export type WatermarkPayload = {
   enabled: true;
@@ -91,6 +92,8 @@ type VideoFlipNative = {
   photoThumbnail(localId: string, side: number): Promise<string>;
   shareFiles(uris: string[]): Promise<void>;
   clipboardText(): string;
+  copyText(text: string): void;
+  cancelDownload(id: string): void;
   sealKuku(plain: string, authKey: string, authSeed: string): { payload: string; iv: string };
   openKuku(packed: string, iv: string): string;
   postPage(url: string, body: string, contentType: string, referer: string): Promise<string>;
@@ -164,6 +167,8 @@ const missing: VideoFlipNative = {
   clipboardText() {
     return '';
   },
+  copyText() {},
+  cancelDownload() {},
   sealKuku() {
     throw new Error(missingMessage);
   },
@@ -192,5 +197,15 @@ function loadNative(): VideoFlipNative {
 }
 
 const VideoFlip = loadNative();
+
+export type LinkPasteButtonProps = {
+  icon?: boolean;
+  background?: string;
+  foreground?: string;
+  onPaste?: (event: { nativeEvent?: { text?: string }; text?: string }) => void;
+  style?: StyleProp<ViewStyle>;
+};
+
+export const LinkPasteButton = requireNativeViewManager<LinkPasteButtonProps>('VideoFlip');
 
 export default VideoFlip;
