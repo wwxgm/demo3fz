@@ -129,6 +129,10 @@ public class VideoFlipModule: Module {
     AsyncFunction("downloadFile") { (url: String, referer: String) async throws -> String in
       try await PageLoader.download(url: url, referer: referer)
     }
+
+    AsyncFunction("downloadPosted") { (url: String, body: String, contentType: String, referer: String) async throws -> String in
+      try await PageLoader.downloadPosted(url: url, body: body, contentType: contentType, referer: referer)
+    }
   }
 }
 
@@ -353,10 +357,20 @@ private enum PageLoader {
   private static let browserAgent = "Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Mobile/15E148 Safari/604.1"
 
   static func download(url: String, referer: String) async throws -> String {
-    try await download(url: url, referer: referer, allowHtmlHop: true)
+    try await download(url: url, body: "", contentType: "", referer: referer, allowHtmlHop: true)
   }
 
-  private static func download(url: String, referer: String, allowHtmlHop: Bool) async throws -> String {
+  static func downloadPosted(url: String, body: String, contentType: String, referer: String) async throws -> String {
+    try await download(url: url, body: body, contentType: contentType, referer: referer, allowHtmlHop: true)
+  }
+
+  private static func download(
+    url: String,
+    body: String,
+    contentType: String,
+    referer: String,
+    allowHtmlHop: Bool
+  ) async throws -> String {
     guard let target = URL(string: url), let scheme = target.scheme?.lowercased(), scheme == "https" || scheme == "http" else {
       throw PageLoadError.message("下载地址无效")
     }
@@ -366,6 +380,11 @@ private enum PageLoader {
     request.setValue("*/*", forHTTPHeaderField: "Accept")
     if !referer.isEmpty {
       request.setValue(referer, forHTTPHeaderField: "Referer")
+    }
+    if !body.isEmpty {
+      request.httpMethod = "POST"
+      request.httpBody = Data(body.utf8)
+      request.setValue(contentType.isEmpty ? "application/x-www-form-urlencoded" : contentType, forHTTPHeaderField: "Content-Type")
     }
     let data: Data
     let response: URLResponse
@@ -381,7 +400,7 @@ private enum PageLoader {
     if allowHtmlHop, mime.contains("html") {
       let sample = data.count > 300_000 ? data.subdata(in: 0..<300_000) : data
       if let html = String(data: sample, encoding: .utf8), let next = firstMediaURL(in: html, base: target) {
-        return try await download(url: next, referer: referer, allowHtmlHop: false)
+        return try await download(url: next, body: "", contentType: "", referer: referer, allowHtmlHop: false)
       }
       throw PageLoadError.message("解析站没有给出视频文件")
     }

@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import {
   ActivityIndicator,
   Alert,
@@ -20,6 +20,11 @@ type MediaLink = {
   label: string;
 };
 
+type SaveJob = {
+  url: string;
+  body?: string;
+};
+
 export function SaveLinkScreen({ onBack }: { onBack: () => void }) {
   const insets = useSafeAreaInsets();
   const { color, palette } = useTheme();
@@ -27,16 +32,21 @@ export function SaveLinkScreen({ onBack }: { onBack: () => void }) {
   const [busy, setBusy] = useState(false);
   const [label, setLabel] = useState('');
 
+  useEffect(() => {
+    const copied = findLink(VideoFlip.clipboardText());
+    if (copied) setDraft(copied);
+  }, []);
+
   const save = async () => {
     if (busy) return;
     setBusy(true);
     setLabel('正在读取链接');
     const saved: string[] = [];
     try {
-      const raw = draft.trim() || VideoFlip.clipboardText();
-      const link = findLink(raw);
+      const copied = findLink(VideoFlip.clipboardText());
+      const link = copied || findLink(draft);
       if (!link) {
-        Alert.alert('没有链接', '先在 Instagram 或 TikTok 里复制视频链接，再点这里。也可以粘到上面的输入框。');
+        Alert.alert('没有链接', '先在 Instagram 或 TikTok 里点复制链接。回到这里再点一次按钮。如果手机问是否允许粘贴，点允许。');
         return;
       }
       setDraft(link);
@@ -54,7 +64,11 @@ export function SaveLinkScreen({ onBack }: { onBack: () => void }) {
       }
       for (let index = 0; index < files.length; index += 1) {
         setLabel(files.length > 1 ? `正在下载 ${index + 1}/${files.length}` : '正在下载');
-        const local = await VideoFlip.downloadFile(files[index], kind === 'tiktok' ? 'https://tiktokio.com/' : 'https://insget.net/');
+        const job = files[index];
+        const referer = kind === 'tiktok' ? 'https://tiktokio.com/' : 'https://insget.net/';
+        const local = job.body
+          ? await VideoFlip.downloadPosted(job.url, job.body, 'application/x-www-form-urlencoded', referer)
+          : await VideoFlip.downloadFile(job.url, referer);
         saved.push(local);
         setLabel(files.length > 1 ? `正在保存 ${index + 1}/${files.length}` : '正在保存到相册');
         await MediaLibrary.createAssetAsync(local);
@@ -76,7 +90,7 @@ export function SaveLinkScreen({ onBack }: { onBack: () => void }) {
       </Pressable>
       <Text style={[styles.title, { color: palette.text }]}>解析短视频</Text>
       <Text style={[styles.subtitle, { color: palette.muted }]}>
-        在 Instagram 或 TikTok 里复制视频链接，回到这里点下面的按钮。Instagram 用 insget.net 解析，TikTok 用 tiktokio.com 解析，然后直接存进相册。只支持公开视频。
+        在 Instagram 或 TikTok 里复制视频链接，回到这里点一次按钮。程序会自己读剪贴板，解析后直接存进 iPhone 相册。只支持公开视频。
       </Text>
       <TextInput
         value={draft}
@@ -84,7 +98,7 @@ export function SaveLinkScreen({ onBack }: { onBack: () => void }) {
         editable={!busy}
         autoCapitalize="none"
         autoCorrect={false}
-        placeholder="也可以在这里长按粘贴链接"
+        placeholder="点下面按钮后，复制的链接会出现在这里"
         placeholderTextColor={palette.muted}
         style={[styles.input, { color: palette.text, backgroundColor: palette.card, borderColor: palette.line }]}
       />
@@ -150,7 +164,7 @@ async function parseInstagram(link: string) {
 async function parseTikTok(link: string) {
   const body = JSON.stringify({ vid: link, prefix: 'tiktokio.com' });
   const html = await VideoFlip.postPage('https://tiktokio.com/api/v1/tk/html', body, 'application/json', 'https://tiktokio.com/');
-  const files = chooseTikTok(html);
+  const files = chooseTikTok(html).map((url) => ({ url }));
   if (files.length === 0) {
     const message = /class="tk-error"[^>]*>([^<]+)/.exec(html)?.[1]?.trim();
     throw new Error(message || '这条链接没有解析出来');
@@ -166,35 +180,81 @@ function chooseTikTok(html: string) {
   return chosen ? [chosen.href] : [];
 }
 
-function chooseInstagram(html: string) {
-  const items = anchors(html, 'https://insget.net/');
-  const downloads = items.filter((item) => /download|下载/i.test(`${item.label} ${item.href}`) && !/mp3/i.test(item.label + item.href));
-  const picked = (downloads.length > 0 ? downloads : items.filter((item) => isFile(item.href))).slice(0, 8);
-  if (picked.length > 0) return unique(picked.map((item) => item.href));
-  const sources = [...html.matchAll(/<(?:video|source)\b[^>]*\bsrc\s*=\s*["']([^"']+)["']/gi)]
-    .map((item) => absolute(decodeHtml(item[1]), 'https://insget.net/'))
-    .filter(isFile);
-  return unique(sources).slice(0, 8);
+function chooseInstagram(html: string): SaveJob[] {
+  const jobs = instagramForms(html);
+  if (jobs.length > 0) return jobs.slice(0, 8);
+  const items = anchors(html, 'https://insget.net/').filter((item) => isFile(item.href) && !isShareLink(item.href));
+  return unique(items.map((item) => item.href)).slice(0, 8).map((url) => ({ url }));
+}
+
+function instagramForms(html: string): SaveJob[] {
+  const jobs: SaveJob[] = [];
+  for (const match of html.matchAll(/<form\b([^>]*)>([\s\S]*?)<\/form>/gi)) {
+    const action = absolute(decodeHtml(/action\s*=\s*["']([^"']+)["']/i.exec(match[1])?.[1] || ''), 'https://insget.net/');
+    const inner = match[2];
+    if (!/data-ftype="video"/i.test(inner)) continue;
+    const token = /name="_token" value="([^"]*)"/.exec(inner)?.[1] || '';
+    const username = /name="username" value="([^"]*)"/.exec(inner)?.[1] || '';
+    const option = /<option value="([^"]*)"/.exec(inner)?.[1] || '';
+    if (!action || !token || !option) continue;
+    jobs.push({
+      url: action,
+      body: encodeForm({ _token: token, action_type: 'download', username, url: option }),
+    });
+  }
+  return jobs;
+}
+
+function encodeForm(fields: Record<string, string>) {
+  return Object.entries(fields)
+    .map(([key, value]) => `${encodeURIComponent(key)}=${encodeURIComponent(value)}`)
+    .join('&');
 }
 
 function anchors(html: string, base: string) {
   const found: MediaLink[] = [];
   const re = /<a\b([^>]*?)>([\s\S]*?)<\/a>/gi;
   for (const match of html.matchAll(re)) {
-    const href = /href\s*=\s*["']([^"']+)["']/i.exec(match[1])?.[1] || '';
+    const attrs = match[1];
+    const href = /(?:href|data-href|data-url|data-link)\s*=\s*["']([^"']+)["']/i.exec(attrs)?.[1] || '';
     const label = match[2].replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim();
     const url = absolute(decodeHtml(href), base);
-    if (!keepAnchor(url, label)) continue;
-    found.push({ href: url, label });
+    if (!keepAnchor(url)) continue;
+    found.push({ href: url, label: `${label} ${attrs}` });
   }
   return found;
 }
 
-function keepAnchor(url: string, label: string) {
+function mediaSources(html: string, base: string) {
+  return [...html.matchAll(/<(?:video|source)\b[^>]*>/gi)].flatMap((tag) => {
+    const src = /src\s*=\s*["']([^"']+)["']/i.exec(tag[0])?.[1] || '';
+    const url = absolute(decodeHtml(src), base);
+    return keepAnchor(url) ? [url] : [];
+  });
+}
+
+function keepAnchor(url: string) {
   if (!/^https?:\/\//i.test(url)) return false;
   if (/\.(mp3|m4a)(\?|$)/i.test(url)) return false;
-  if (isFile(url)) return true;
-  return /^(download|下载)\b/i.test(label) && /download/i.test(url);
+  return true;
+}
+
+function isSiteHome(url: string) {
+  try {
+    const parsed = new URL(url);
+    return parsed.pathname === '/' || parsed.pathname === '';
+  } catch {
+    return false;
+  }
+}
+
+function isShareLink(url: string) {
+  try {
+    const host = new URL(url).hostname.toLowerCase();
+    return host.includes('facebook.com') || host.includes('twitter.com') || host === 'x.com' || host.includes('t.me');
+  } catch {
+    return false;
+  }
 }
 
 function isFile(url: string) {
