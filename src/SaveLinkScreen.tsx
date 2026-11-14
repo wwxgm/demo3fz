@@ -47,6 +47,7 @@ type Row = {
   link: string;
   progress: number;
   message: string;
+  duration?: number;
   phase: RowPhase;
   preview: string;
 };
@@ -351,6 +352,12 @@ export function SaveLinkScreen({ onBack }: { onBack?: () => void }) {
           } catch {
             // 抽不到画面时继续用封面。
           }
+          try {
+            const seconds = await VideoFlip.mediaDuration(local);
+            if (!dropped.current.has(row.id) && seconds > 0) patch(row.id, { duration: seconds });
+          } catch {
+            // 读不到时长时卡片上就不显示这一项。
+          }
         }
         let output = local;
         if (flipOnRef.current && !isStillImage(local)) {
@@ -557,18 +564,7 @@ export function SaveLinkScreen({ onBack }: { onBack?: () => void }) {
       />
       <View style={styles.actions}>
         <LinkPasteButton icon={false} background={color} foreground="#FFFFFF" onPaste={(event) => pasteText(event, true)} style={styles.pasteWide} />
-        <View style={[styles.pastePlus, { backgroundColor: color }]}>
-          <LinkPasteButton
-            icon
-            background={color}
-            foreground={color}
-            onPaste={(event) => pasteText(event, true)}
-            style={styles.pastePlusFill}
-          />
-          <View pointerEvents="none" style={[styles.pastePlusFill, styles.plusCover, { backgroundColor: color }]}>
-            <Text style={styles.plusText}>+</Text>
-          </View>
-        </View>
+        <LinkPasteButton icon background={color} foreground="#FFFFFF" onPaste={(event) => pasteText(event, true)} style={styles.pastePlus} />
         <Pressable style={[styles.small, styles.plain, { borderColor: palette.line }]} onPress={() => addLink(draft, false)}>
           <Text style={[styles.plainText, { color: palette.text }]}>加入</Text>
         </Pressable>
@@ -608,6 +604,9 @@ export function SaveLinkScreen({ onBack }: { onBack?: () => void }) {
                   <View style={[styles.track, { backgroundColor: palette.line }]}>
                     <View style={[styles.fill, { width: `${Math.round(row.progress * 100)}%`, backgroundColor: color }]} />
                   </View>
+                  {row.duration ? (
+                    <Text style={[styles.status, { color: palette.text }]}>时长 {formatClock(row.duration)}</Text>
+                  ) : null}
                   <Text style={[styles.status, { color: row.phase === 'error' ? '#C2410C' : palette.muted }]} numberOfLines={2}>
                     {row.message}
                   </Text>
@@ -646,6 +645,14 @@ async function ensureAlbumPermission() {
     { text: '去设置', onPress: () => void Linking.openSettings() },
   ]);
   return false;
+}
+
+function formatClock(seconds?: number) {
+  if (!seconds || seconds <= 0) return '';
+  const total = Math.round(seconds);
+  const minutes = Math.floor(total / 60);
+  const rest = total % 60;
+  return `${minutes}:${String(rest).padStart(2, '0')}`;
 }
 
 function findLinks(text: string) {

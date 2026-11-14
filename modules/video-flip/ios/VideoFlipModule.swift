@@ -86,6 +86,10 @@ public class VideoFlipModule: Module {
       try await ImageMark.frameAt(uri: uri, seconds: seconds)
     }
 
+    AsyncFunction("mediaDuration") { (uri: String) async throws -> Double in
+      try await VideoFlipper.mediaDuration(uri)
+    }
+
     AsyncFunction("makeCover") { (uri: String, text: String) async throws -> String in
       try await CoverMaker.make(uri: uri, text: text)
     }
@@ -2046,6 +2050,21 @@ private enum VideoFlipper {
       return nil
     }
     return number.doubleValue
+  }
+
+  static func mediaDuration(_ uri: String) async throws -> Double {
+    let source = try resolveFileURL(uri)
+    let accessed = source.startAccessingSecurityScopedResource()
+    defer {
+      if accessed {
+        source.stopAccessingSecurityScopedResource()
+      }
+    }
+    let seconds = try await AVURLAsset(url: source).load(.duration).seconds
+    guard seconds.isFinite, seconds > 0 else {
+      throw VideoFlipError.badUri
+    }
+    return seconds
   }
 
   static func sourceReady(_ uri: String) -> Bool {

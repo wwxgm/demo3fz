@@ -50,6 +50,7 @@ type VideoFlipNative = {
   processImage(uri: string, options: ImageProcessOptions): Promise<string>;
   sampleFrames(uri: string, count: number): Promise<string[]>;
   frameAt(uri: string, seconds: number): Promise<string>;
+  mediaDuration(uri: string): Promise<number>;
   makeCover(uri: string, text: string): Promise<string>;
   coverSmear(uri: string, options: {
     regions: {
@@ -117,6 +118,9 @@ const missing: VideoFlipNative = {
   },
   async frameAt() {
     throw new Error(missingMessage);
+  },
+  async mediaDuration() {
+    return 0;
   },
   async makeCover() {
     throw new Error(missingMessage);

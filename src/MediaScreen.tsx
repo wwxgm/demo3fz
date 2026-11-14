@@ -127,9 +127,10 @@ function sourceReady(uri: string) {
 function formatDuration(durationMs?: number) {
   if (!durationMs || durationMs <= 0) return '';
   const total = Math.round(durationMs / 1000);
+  if (total <= 0) return '';
   const minutes = Math.floor(total / 60);
   const seconds = total % 60;
-  return `${minutes}:${String(seconds).padStart(2, '0')}`;
+  return `时长 ${minutes}:${String(seconds).padStart(2, '0')}`;
 }
 
 export function MediaScreen() {
@@ -187,6 +188,38 @@ export function MediaScreen() {
     videosRef.current = next;
     setVideos(next);
   };
+  const durationTried = useRef(new Set<string>());
+
+  useEffect(() => {
+    const pending = videos.filter(
+      (item) => !durationTried.current.has(item.id) && (!item.durationMs || item.durationMs < 500),
+    );
+    if (pending.length === 0) return;
+    let cancel = false;
+    void (async () => {
+      for (const item of pending) {
+        if (cancel || durationTried.current.has(item.id)) continue;
+        durationTried.current.add(item.id);
+        let durationMs = -1;
+        try {
+          const seconds = await VideoFlip.mediaDuration(item.uri);
+          if (seconds > 0.05) durationMs = Math.round(seconds * 1000);
+        } catch {
+          durationMs = -1;
+        }
+        if (cancel) {
+          durationTried.current.delete(item.id);
+          return;
+        }
+        commitVideos((prev) =>
+          prev.map((it) => (it.id === item.id && (!it.durationMs || it.durationMs < 500) ? { ...it, durationMs } : it)),
+        );
+      }
+    })();
+    return () => {
+      cancel = true;
+    };
+  }, [videos]);
 
   const withNative = <T,>(job: () => Promise<T>) => {
     const run = nativeTail.current.then(job, job);
@@ -1339,7 +1372,8 @@ export function MediaScreen() {
                 ) : null}
                 {listed.map((item) => {
             const index = Math.max(0, items.findIndex((it) => it.id === item.id));
-            const meta = [item.source, formatDuration(item.durationMs), formatSize(item.size)].filter(Boolean).join(' · ');
+            const clock = formatDuration(item.durationMs);
+            const meta = [item.source, clock, formatSize(item.size)].filter(Boolean).join(' · ');
             const isSample = kind === 'image' && sample?.id === item.id;
             const flipFallback = kind === 'video' && item.flipFallback === true;
             const savedFolded =
@@ -1349,7 +1383,8 @@ export function MediaScreen() {
                 <View key={item.id} style={styles.card}>
                   <View style={styles.compactRow}>
                     <Text style={styles.cardName} numberOfLines={1}>
-                      {index + 1}. {item.name} · 已保存
+                      {index + 1}. {item.name}
+                      {clock ? ` · ${clock}` : ''} · 已保存
                     </Text>
                     <Pressable onPress={() => setOpenSaved((prev) => ({ ...prev, [item.id]: true }))} hitSlop={8}>
                       <Text style={styles.link}>展开</Text>
