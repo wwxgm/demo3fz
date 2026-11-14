@@ -96,6 +96,8 @@ type VideoFlipNative = {
   postPage(url: string, body: string, contentType: string, referer: string): Promise<string>;
   downloadFile(url: string, referer: string, jobId: string): Promise<string>;
   downloadPosted(url: string, body: string, contentType: string, referer: string, jobId: string): Promise<string>;
+  holdBackground(): void;
+  releaseBackground(): void;
 };
 
 const missingMessage = '当前安装包没有处理模块，请重新打包 IPA 后再使用';
@@ -177,6 +179,8 @@ const missing: VideoFlipNative = {
   async downloadPosted() {
     throw new Error(missingMessage);
   },
+  holdBackground() {},
+  releaseBackground() {},
 };
 
 function loadNative(): VideoFlipNative {

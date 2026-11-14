@@ -41,6 +41,14 @@ public class VideoFlipModule: Module {
       DownloadHub.shared.progress(id)
     }
 
+    Function("holdBackground") {
+      BackgroundKeep.hold()
+    }
+
+    Function("releaseBackground") {
+      BackgroundKeep.release()
+    }
+
     Function("cancelFlip") { (id: String) in
       FlipControl.cancel(id)
     }
@@ -375,8 +383,62 @@ private enum PageLoadError: LocalizedError {
   }
 }
 
+private enum BackgroundKeep {
+  private static let lock = NSLock()
+  private static var token: UIBackgroundTaskIdentifier = .invalid
+  private static var wants = 0
+
+  static func hold() {
+    lock.lock()
+    wants += 1
+    lock.unlock()
+    ensure()
+  }
+
+  static func release() {
+    lock.lock()
+    wants = max(0, wants - 1)
+    let id = wants == 0 ? token : UIBackgroundTaskIdentifier.invalid
+    if wants == 0 {
+      token = .invalid
+    }
+    lock.unlock()
+    if id != .invalid {
+      UIApplication.shared.endBackgroundTask(id)
+    }
+  }
+
+  static func ensure() {
+    lock.lock()
+    let needed = wants > 0 && token == .invalid
+    lock.unlock()
+    guard needed else { return }
+    var created: UIBackgroundTaskIdentifier = .invalid
+    created = UIApplication.shared.beginBackgroundTask(withName: "save-link") {
+      lock.lock()
+      let id = token
+      token = .invalid
+      lock.unlock()
+      if id != .invalid {
+        UIApplication.shared.endBackgroundTask(id)
+      }
+    }
+    lock.lock()
+    if wants > 0 && token == .invalid && created != .invalid {
+      token = created
+      lock.unlock()
+    } else {
+      lock.unlock()
+      if created != .invalid {
+        UIApplication.shared.endBackgroundTask(created)
+      }
+    }
+  }
+}
+
 private final class DownloadHub: NSObject, URLSessionDownloadDelegate {
   static let shared = DownloadHub()
+  static let identifier = "com.local.iphonehello.save-link"
 
   private final class Slot {
     var continuation: CheckedContinuation<URL, Error>?
@@ -398,13 +460,27 @@ private final class DownloadHub: NSObject, URLSessionDownloadDelegate {
 
   private let lock = NSLock()
   private var progressMap: [String: Double] = [:]
-  private var slots: [Int: Slot] = [:]
-  private lazy var session: URLSession = {
-    let config = URLSessionConfiguration.default
-    config.timeoutIntervalForRequest = 90
-    config.timeoutIntervalForResource = 180
+  private var slots: [ObjectIdentifier: Slot] = [:]
+  private var backgroundCompletion: (() -> Void)?
+  private lazy var session: URLSession = makeSession(background: true)
+  private lazy var postedSession: URLSession = makeSession(background: false)
+
+  private func makeSession(background: Bool) -> URLSession {
+    let config: URLSessionConfiguration
+    if background {
+      config = URLSessionConfiguration.background(withIdentifier: DownloadHub.identifier)
+      config.isDiscretionary = false
+      config.sessionSendsLaunchEvents = true
+      config.timeoutIntervalForResource = 3600
+    } else {
+      config = URLSessionConfiguration.default
+      config.timeoutIntervalForRequest = 90
+      config.timeoutIntervalForResource = 600
+      config.httpMaximumConnectionsPerHost = 6
+    }
+    config.httpCookieStorage = HTTPCookieStorage.shared
     return URLSession(configuration: config, delegate: self, delegateQueue: nil)
-  }()
+  }
 
   func progress(_ id: String) -> Double {
     lock.lock()
@@ -413,12 +489,54 @@ private final class DownloadHub: NSObject, URLSessionDownloadDelegate {
     return value
   }
 
+  func handleBackgroundEvents(identifier: String, completionHandler: @escaping () -> Void) {
+    guard identifier == DownloadHub.identifier else { return }
+    _ = session
+    lock.lock()
+    backgroundCompletion = completionHandler
+    lock.unlock()
+  }
+
   func fetch(url: String, body: String, contentType: String, referer: String, jobId: String) async throws -> (file: URL, response: HTTPURLResponse) {
+    let background = body.isEmpty && !Self.appIsActive()
+    do {
+      return try await transfer(url: url, body: body, contentType: contentType, referer: referer, jobId: jobId, background: background)
+    } catch let error as PageLoadError {
+      guard background, error.errorDescription == "视频没有下载下来" else { throw error }
+    } catch {
+      guard background else { throw error }
+    }
+    await Self.leaveSessionQueue()
+    return try await transfer(url: url, body: body, contentType: contentType, referer: referer, jobId: jobId, background: false)
+  }
+
+  private static func appIsActive() -> Bool {
+    UIApplication.shared.applicationState == .active
+  }
+
+  private static func leaveSessionQueue() async {
+    await withCheckedContinuation { (done: CheckedContinuation<Void, Never>) in
+      DispatchQueue.global(qos: .userInitiated).async {
+        done.resume()
+      }
+    }
+  }
+
+  private func transfer(
+    url: String,
+    body: String,
+    contentType: String,
+    referer: String,
+    jobId: String,
+    background: Bool
+  ) async throws -> (file: URL, response: HTTPURLResponse) {
+    BackgroundKeep.hold()
+    defer { BackgroundKeep.release() }
     guard let target = URL(string: url), let scheme = target.scheme?.lowercased(), scheme == "https" || scheme == "http" else {
       throw PageLoadError.message("下载地址无效")
     }
     var request = URLRequest(url: target)
-    request.timeoutInterval = 90
+    request.timeoutInterval = background ? 3600 : 90
     request.setValue(
       "Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Mobile/15E148 Safari/604.1",
       forHTTPHeaderField: "User-Agent"
@@ -427,19 +545,25 @@ private final class DownloadHub: NSObject, URLSessionDownloadDelegate {
     if !referer.isEmpty {
       request.setValue(referer, forHTTPHeaderField: "Referer")
     }
-    if !body.isEmpty {
-      request.httpMethod = "POST"
-      request.httpBody = Data(body.utf8)
-      request.setValue(contentType.isEmpty ? "application/x-www-form-urlencoded" : contentType, forHTTPHeaderField: "Content-Type")
+    let active: URLSession
+    if body.isEmpty && background {
+      active = session
+    } else {
+      active = postedSession
+      if !body.isEmpty {
+        request.httpMethod = "POST"
+        request.httpBody = Data(body.utf8)
+        request.setValue(contentType.isEmpty ? "application/x-www-form-urlencoded" : contentType, forHTTPHeaderField: "Content-Type")
+      }
     }
     setProgress(jobId, 0.02)
-    let task = session.downloadTask(with: request)
+    let task = active.downloadTask(with: request)
     task.taskDescription = jobId
     let file: URL = try await withCheckedThrowingContinuation { continuation in
       let slot = Slot()
       slot.continuation = continuation
       lock.lock()
-      slots[task.taskIdentifier] = slot
+      slots[slotKey(task)] = slot
       lock.unlock()
       task.resume()
     }
@@ -448,6 +572,10 @@ private final class DownloadHub: NSObject, URLSessionDownloadDelegate {
       throw PageLoadError.message("视频没有下载下来")
     }
     return (file, http)
+  }
+
+  private func slotKey(_ task: URLSessionTask) -> ObjectIdentifier {
+    ObjectIdentifier(task)
   }
 
   private func setProgress(_ id: String, _ value: Double) {
@@ -483,19 +611,20 @@ private final class DownloadHub: NSObject, URLSessionDownloadDelegate {
       }
       try FileManager.default.moveItem(at: location, to: dest)
       lock.lock()
-      slots[downloadTask.taskIdentifier]?.file = dest
+      slots[slotKey(downloadTask)]?.file = dest
       lock.unlock()
     } catch {
       lock.lock()
-      let slot = slots[downloadTask.taskIdentifier]
+      let slot = slots[slotKey(downloadTask)]
       lock.unlock()
       slot?.finish(.failure(PageLoadError.message("视频没有保存下来")))
     }
   }
 
   func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
+    BackgroundKeep.ensure()
     lock.lock()
-    let slot = slots.removeValue(forKey: task.taskIdentifier)
+    let slot = slots.removeValue(forKey: slotKey(task))
     lock.unlock()
     guard let slot else { return }
     if let error {
@@ -514,6 +643,28 @@ private final class DownloadHub: NSObject, URLSessionDownloadDelegate {
       return
     }
     slot.finish(.success(file))
+  }
+
+  func urlSessionDidFinishEvents(forBackgroundURLSession session: URLSession) {
+    lock.lock()
+    let handler = backgroundCompletion
+    backgroundCompletion = nil
+    lock.unlock()
+    guard let handler else { return }
+    DispatchQueue.main.async {
+      handler()
+    }
+  }
+}
+
+@objc(SaveLinkBackground)
+public class SaveLinkBackground: NSObject, ExpoAppDelegateSubscriber {
+  public func application(
+    _ application: UIApplication,
+    handleEventsForBackgroundURLSession identifier: String,
+    completionHandler: @escaping () -> Void
+  ) {
+    DownloadHub.shared.handleBackgroundEvents(identifier: identifier, completionHandler: completionHandler)
   }
 }
 

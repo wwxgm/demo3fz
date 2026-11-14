@@ -56,7 +56,7 @@ export function SaveLinkScreen({ onBack }: { onBack?: () => void }) {
   const { color, palette } = useTheme();
   const [draft, setDraft] = useState('');
   const [rows, setRows] = useState<Row[]>([]);
-  const [flipOn, setFlipOn] = useState(false);
+  const [flipOn, setFlipOn] = useState(true);
   const [busy, setBusy] = useState(false);
   const seen = useRef(new Set<string>());
 
@@ -183,9 +183,7 @@ export function SaveLinkScreen({ onBack }: { onBack?: () => void }) {
               message: files.length > 1 ? `正在下载 ${index + 1}/${files.length}` : '正在下载',
               progress: 0,
             });
-            const local = job.body
-              ? await VideoFlip.downloadPosted(job.url, job.body, 'application/x-www-form-urlencoded', referer, row.id)
-              : await VideoFlip.downloadFile(job.url, referer, row.id);
+            const local = await fetchSavedFile(job, referer, row.id);
             locals.push(local);
             let output = local;
             if (flipOn && !isStillImage(local)) {
@@ -216,6 +214,7 @@ export function SaveLinkScreen({ onBack }: { onBack?: () => void }) {
       }
     };
     try {
+      VideoFlip.holdBackground();
       if (flipOn) VideoFlip.prepareFlipBatch();
       const width = Math.min(3, queue.length);
       await Promise.all(Array.from({ length: width }, () => worker()));
@@ -236,6 +235,7 @@ export function SaveLinkScreen({ onBack }: { onBack?: () => void }) {
         ),
       );
     } finally {
+      VideoFlip.releaseBackground();
       setBusy(false);
     }
   };
@@ -249,7 +249,7 @@ export function SaveLinkScreen({ onBack }: { onBack?: () => void }) {
       ) : null}
       <Text style={[styles.title, { color: palette.text }]}>解析短视频</Text>
       <Text style={[styles.subtitle, { color: palette.muted }]}>
-        支持抖音、快手、视频号、Threads、X，以及 Instagram、TikTok 的公开视频。复制一条后点「粘贴」，再加下一条就点「+」。相同链接会自动去掉。点「保存」才会下载到相册。
+        支持抖音、快手、视频号、Threads、X，以及 Instagram、TikTok 的公开视频。复制一条后点「粘贴」，再加下一条就点「+」。相同链接会自动去掉。点「保存」后可以切去别的 App，下载会继续，完成后进入相册。
       </Text>
       <TextInput
         value={draft}
@@ -339,7 +339,10 @@ async function ensureAlbumPermission() {
 function findLink(text: string) {
   const match = text.match(/https?:\/\/[^\s<>"']+/i);
   if (!match) return '';
-  return match[0].replace(/[，。；;、,）)]+$/g, '');
+  return match[0]
+    .replace(/[\u200b\u200c\u200d\ufeff]/g, '')
+    .replace(/[\u4e00-\u9fff\u3000-\u303f\uff00-\uffef].*$/g, '')
+    .replace(/[，。；;、,）)\]】》>"']+$/g, '');
 }
 
 function platformOf(url: string) {
@@ -430,17 +433,32 @@ async function parseKuku(link: string) {
   return jobs;
 }
 
+const MAX_FILE_BYTES = 80_000_000;
+
+function bestVideo(item: KukuMedia | string) {
+  if (typeof item === 'string') return item.startsWith('http') ? item : '';
+  const infos = (item.video_fullinfo || [])
+    .filter((info) => typeof info.url === 'string' && info.url.startsWith('http'))
+    .map((info) => ({ url: info.url as string, size: Number(info.size || 0) }));
+  const fit = infos.filter((info) => info.size > 0 && info.size <= MAX_FILE_BYTES);
+  if (fit.length > 0) {
+    fit.sort((left, right) => right.size - left.size);
+    return fit[0].url;
+  }
+  const unknown = infos.filter((info) => info.size <= 0);
+  if (unknown.length > 0) return unknown[0].url;
+  if (infos.length > 0) {
+    infos.sort((left, right) => left.size - right.size);
+    return infos[0].url;
+  }
+  return item.url && item.url.startsWith('http') ? item.url : '';
+}
+
 function chooseKuku(data: KukuData): SaveJob[] {
   const videos: string[] = [];
   for (const item of data.videos || []) {
-    if (typeof item === 'string') {
-      videos.push(item);
-      continue;
-    }
-    const ranked = (item.video_fullinfo || []).filter((info) => typeof info.url === 'string' && info.url.startsWith('http'));
-    ranked.sort((left, right) => Number(right.size || 0) - Number(left.size || 0));
-    if (ranked[0]?.url) videos.push(ranked[0].url);
-    else if (item.url && item.url.startsWith('http')) videos.push(item.url);
+    const url = bestVideo(item);
+    if (url) videos.push(url);
   }
   if (videos.length === 0 && data.url && data.url.startsWith('http')) videos.push(data.url);
   const files = unique(videos).slice(0, 3).map((url) => ({ url }));
@@ -448,6 +466,20 @@ function chooseKuku(data: KukuData): SaveJob[] {
   const raw = unique((data.pics || []).filter((url) => url.startsWith('http')));
   const images = raw.filter((url) => url !== data.cover);
   return (images.length > 0 ? images : raw).slice(0, 8).map((url) => ({ url }));
+}
+
+async function fetchSavedFile(job: SaveJob, referer: string, id: string) {
+  try {
+    return job.body
+      ? await VideoFlip.downloadPosted(job.url, job.body, 'application/x-www-form-urlencoded', referer, id)
+      : await VideoFlip.downloadFile(job.url, referer, id);
+  } catch (error) {
+    const message = errorText(error);
+    if (!referer || !/没有给出视频文件|HTTP 403|HTTP 401/.test(message)) throw error;
+    return job.body
+      ? await VideoFlip.downloadPosted(job.url, job.body, 'application/x-www-form-urlencoded', '', id)
+      : await VideoFlip.downloadFile(job.url, '', id);
+  }
 }
 
 async function parseInstagram(link: string) {
