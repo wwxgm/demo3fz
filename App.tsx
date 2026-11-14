@@ -2,14 +2,14 @@ import { useState } from 'react';
 import { Pressable, StyleSheet, Text, View } from 'react-native';
 import { StatusBar } from 'expo-status-bar';
 import { SafeAreaProvider, useSafeAreaInsets } from 'react-native-safe-area-context';
-import { HotScreen } from './src/HotScreen';
 import { MediaScreen } from './src/MediaScreen';
 import { PosterScreen } from './src/PosterScreen';
+import { SaveLinkScreen } from './src/SaveLinkScreen';
 import { SearchScreen } from './src/SearchScreen';
 import { SettingsScreen } from './src/SettingsScreen';
 import { ThemeProvider, useTheme } from './src/theme';
 
-type Tab = 'media' | 'search' | 'hot' | 'poster' | 'settings';
+type Tab = 'media' | 'search' | 'save' | 'poster' | 'settings';
 
 export default function App() {
   return (
@@ -34,8 +34,8 @@ function Shell() {
           <MediaScreen />
         ) : tab === 'search' ? (
           <SearchScreen />
-        ) : tab === 'hot' ? (
-          <HotScreen />
+        ) : tab === 'save' ? (
+          <SaveLinkScreen />
         ) : tab === 'poster' ? (
           <PosterScreen />
         ) : (
@@ -50,7 +50,7 @@ function Shell() {
       >
         <TabButton label="视频图片" active={tab === 'media'} onPress={() => setTab('media')} />
         <TabButton label="搜索" active={tab === 'search'} onPress={() => setTab('search')} />
-        <TabButton label="热点" active={tab === 'hot'} onPress={() => setTab('hot')} />
+        <TabButton label="短视频" active={tab === 'save'} onPress={() => setTab('save')} />
         <TabButton label="大字报" active={tab === 'poster'} onPress={() => setTab('poster')} />
         <TabButton label="设置" active={tab === 'settings'} onPress={() => setTab('settings')} />
       </View>

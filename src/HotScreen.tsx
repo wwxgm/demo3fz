@@ -44,7 +44,7 @@ const X_FEEDS = [
   'https://nitter.privacydev.net/search/rss?f=tweets&q=AI',
 ];
 
-export function HotScreen() {
+export function HotScreen({ onBack }: { onBack?: () => void }) {
   const insets = useSafeAreaInsets();
   const { color, palette } = useTheme();
   const styles = useMemo(() => createHotStyles(palette), [palette]);
@@ -102,6 +102,11 @@ export function HotScreen() {
 
   return (
     <View style={[styles.screen, { paddingTop: insets.top + 8 }]}>
+      {onBack ? (
+        <Pressable onPress={onBack} hitSlop={8}>
+          <Text style={[styles.back, { color }]}>返回</Text>
+        </Pressable>
+      ) : null}
       <Text style={styles.title}>热点</Text>
       <Text style={styles.subtitle}>
         读取各平台最新热点。点一条会打开对应应用，没安装就用浏览器打开。X 上的 AI 需要能连上 X，开了 VPN 后再刷新。
@@ -401,6 +406,11 @@ function createHotStyles(palette: Palette) {
     screen: {
       flex: 1,
       paddingHorizontal: 20,
+    },
+    back: {
+      fontSize: 16,
+      fontWeight: '600',
+      marginBottom: 8,
     },
     title: {
       color: palette.text,

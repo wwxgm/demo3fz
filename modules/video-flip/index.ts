@@ -83,6 +83,7 @@ type VideoFlipNative = {
   installDaysLeft(): number;
   prepareFlipBatch(): void;
   flipProgress(id: string): number;
+  downloadProgress(id: string): number;
   cancelFlip(id: string): void;
   cancelAllFlips(): void;
   removeTempFile(uri: string): void;
@@ -90,9 +91,11 @@ type VideoFlipNative = {
   photoThumbnail(localId: string, side: number): Promise<string>;
   shareFiles(uris: string[]): Promise<void>;
   clipboardText(): string;
+  sealKuku(plain: string, authKey: string, authSeed: string): { payload: string; iv: string };
+  openKuku(packed: string, iv: string): string;
   postPage(url: string, body: string, contentType: string, referer: string): Promise<string>;
-  downloadFile(url: string, referer: string): Promise<string>;
-  downloadPosted(url: string, body: string, contentType: string, referer: string): Promise<string>;
+  downloadFile(url: string, referer: string, jobId: string): Promise<string>;
+  downloadPosted(url: string, body: string, contentType: string, referer: string, jobId: string): Promise<string>;
 };
 
 const missingMessage = '当前安装包没有处理模块，请重新打包 IPA 后再使用';
@@ -141,6 +144,9 @@ const missing: VideoFlipNative = {
   flipProgress() {
     return 0;
   },
+  downloadProgress() {
+    return 0;
+  },
   cancelFlip() {},
   cancelAllFlips() {},
   removeTempFile() {},
@@ -155,6 +161,12 @@ const missing: VideoFlipNative = {
   },
   clipboardText() {
     return '';
+  },
+  sealKuku() {
+    throw new Error(missingMessage);
+  },
+  openKuku() {
+    throw new Error(missingMessage);
   },
   async postPage() {
     throw new Error(missingMessage);

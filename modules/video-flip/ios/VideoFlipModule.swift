@@ -1,4 +1,6 @@
 import AVFoundation
+import CommonCrypto
+import CryptoKit
 import ExpoModulesCore
 import Photos
 import UIKit
@@ -33,6 +35,10 @@ public class VideoFlipModule: Module {
 
     Function("flipProgress") { (id: String) -> Double in
       FlipControl.value(id)
+    }
+
+    Function("downloadProgress") { (id: String) -> Double in
+      DownloadHub.shared.progress(id)
     }
 
     Function("cancelFlip") { (id: String) in
@@ -122,16 +128,32 @@ public class VideoFlipModule: Module {
       return text
     }
 
+    Function("sealKuku") { (plain: String, authKey: String, authSeed: String) throws -> [String: String] in
+      do {
+        return try KukuCrypto.seal(plain: plain, authKey: authKey, authSeed: authSeed)
+      } catch {
+        throw PageLoadError.message("解析请求没有封装成功")
+      }
+    }
+
+    Function("openKuku") { (packed: String, iv: String) throws -> String in
+      do {
+        return try KukuCrypto.open(packed: packed, iv: iv)
+      } catch {
+        throw PageLoadError.message("解析结果无法读取")
+      }
+    }
+
     AsyncFunction("postPage") { (url: String, body: String, contentType: String, referer: String) async throws -> String in
       try await PageLoader.post(url: url, body: body, contentType: contentType, referer: referer)
     }
 
-    AsyncFunction("downloadFile") { (url: String, referer: String) async throws -> String in
-      try await PageLoader.download(url: url, referer: referer)
+    AsyncFunction("downloadFile") { (url: String, referer: String, jobId: String) async throws -> String in
+      try await PageLoader.download(url: url, referer: referer, jobId: jobId)
     }
 
-    AsyncFunction("downloadPosted") { (url: String, body: String, contentType: String, referer: String) async throws -> String in
-      try await PageLoader.downloadPosted(url: url, body: body, contentType: contentType, referer: referer)
+    AsyncFunction("downloadPosted") { (url: String, body: String, contentType: String, referer: String, jobId: String) async throws -> String in
+      try await PageLoader.downloadPosted(url: url, body: body, contentType: contentType, referer: referer, jobId: jobId)
     }
   }
 }
@@ -267,6 +289,81 @@ private enum ShareError: LocalizedError {
   }
 }
 
+private enum KukuCrypto {
+  static func seal(plain: String, authKey: String, authSeed: String) throws -> [String: String] {
+    let material = Data("\(authKey):\(authSeed)".utf8)
+    let key = SymmetricKey(data: Data(SHA256.hash(data: material)))
+    let sealed = try AES.GCM.seal(Data(plain.utf8), using: key)
+    let payload = sealed.ciphertext + sealed.tag
+    let iv = sealed.nonce.withUnsafeBytes { Data($0) }
+    return [
+      "payload": payload.base64EncodedString(),
+      "iv": iv.base64EncodedString(),
+    ]
+  }
+
+  static func open(packed: String, iv: String) throws -> String {
+    guard let data = Data(base64Encoded: unshuffle(packed)),
+          let ivData = Data(base64Encoded: unshuffle(iv)),
+          ivData.count == kCCBlockSizeAES128 else {
+      throw PageLoadError.message("解析结果无法读取")
+    }
+    let key = Data(SHA256.hash(data: Data("12345678901234567890123456789013".utf8)))
+    guard let plain = decryptCBC(data: data, key: key, iv: ivData),
+          let text = String(data: plain, encoding: .utf8), !text.isEmpty else {
+      throw PageLoadError.message("解析结果无法读取")
+    }
+    return text
+  }
+
+  private static func decryptCBC(data: Data, key: Data, iv: Data) -> Data? {
+    var output = Data(count: data.count + kCCBlockSizeAES128)
+    let moved = output.withUnsafeMutableBytes { outputBytes -> Int in
+      data.withUnsafeBytes { dataBytes -> Int in
+        iv.withUnsafeBytes { ivBytes -> Int in
+          key.withUnsafeBytes { keyBytes -> Int in
+            var count = 0
+            let status = CCCrypt(
+              CCOperation(kCCDecrypt),
+              CCAlgorithm(kCCAlgorithmAES),
+              CCOptions(kCCOptionPKCS7Padding),
+              keyBytes.baseAddress,
+              kCCKeySizeAES256,
+              ivBytes.baseAddress,
+              dataBytes.baseAddress,
+              data.count,
+              outputBytes.baseAddress,
+              outputBytes.count,
+              &count
+            )
+            return status == kCCSuccess ? count : 0
+          }
+        }
+      }
+    }
+    guard moved > 0, moved <= output.count else { return nil }
+    return Data(output.prefix(moved))
+  }
+
+  private static func unshuffle(_ value: String) -> String {
+    let mixed = String(value.utf8.compactMap { UnicodeScalar(UInt32($0) ^ 90) }.map(Character.init))
+    var chunks: [Character] = []
+    let chars = Array(mixed)
+    var index = 0
+    while index < chars.count {
+      let end = min(index + 8, chars.count)
+      chunks.append(contentsOf: chars[index..<end].reversed())
+      index = end
+    }
+    let source = Array("ZYXABCDEFGHIJKLMNOPQRSTUVWzyxabcdefghijklmnopqrstuvw9876543210-_")
+    let target = Array("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/")
+    return String(chunks.map { char in
+      guard let found = source.firstIndex(of: char) else { return char }
+      return target[found]
+    })
+  }
+}
+
 private enum PageLoadError: LocalizedError {
   case message(String)
 
@@ -275,6 +372,148 @@ private enum PageLoadError: LocalizedError {
     case .message(let text):
       return text
     }
+  }
+}
+
+private final class DownloadHub: NSObject, URLSessionDownloadDelegate {
+  static let shared = DownloadHub()
+
+  private final class Slot {
+    var continuation: CheckedContinuation<URL, Error>?
+    var file: URL?
+    private var resumed = false
+
+    func finish(_ result: Result<URL, Error>) {
+      guard !resumed, let continuation else { return }
+      resumed = true
+      self.continuation = nil
+      switch result {
+      case .success(let url):
+        continuation.resume(returning: url)
+      case .failure(let error):
+        continuation.resume(throwing: error)
+      }
+    }
+  }
+
+  private let lock = NSLock()
+  private var progressMap: [String: Double] = [:]
+  private var slots: [Int: Slot] = [:]
+  private lazy var session: URLSession = {
+    let config = URLSessionConfiguration.default
+    config.timeoutIntervalForRequest = 90
+    config.timeoutIntervalForResource = 180
+    return URLSession(configuration: config, delegate: self, delegateQueue: nil)
+  }()
+
+  func progress(_ id: String) -> Double {
+    lock.lock()
+    let value = progressMap[id] ?? 0
+    lock.unlock()
+    return value
+  }
+
+  func fetch(url: String, body: String, contentType: String, referer: String, jobId: String) async throws -> (file: URL, response: HTTPURLResponse) {
+    guard let target = URL(string: url), let scheme = target.scheme?.lowercased(), scheme == "https" || scheme == "http" else {
+      throw PageLoadError.message("下载地址无效")
+    }
+    var request = URLRequest(url: target)
+    request.timeoutInterval = 90
+    request.setValue(
+      "Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Mobile/15E148 Safari/604.1",
+      forHTTPHeaderField: "User-Agent"
+    )
+    request.setValue("*/*", forHTTPHeaderField: "Accept")
+    if !referer.isEmpty {
+      request.setValue(referer, forHTTPHeaderField: "Referer")
+    }
+    if !body.isEmpty {
+      request.httpMethod = "POST"
+      request.httpBody = Data(body.utf8)
+      request.setValue(contentType.isEmpty ? "application/x-www-form-urlencoded" : contentType, forHTTPHeaderField: "Content-Type")
+    }
+    setProgress(jobId, 0.02)
+    let task = session.downloadTask(with: request)
+    task.taskDescription = jobId
+    let file: URL = try await withCheckedThrowingContinuation { continuation in
+      let slot = Slot()
+      slot.continuation = continuation
+      lock.lock()
+      slots[task.taskIdentifier] = slot
+      lock.unlock()
+      task.resume()
+    }
+    guard let http = task.response as? HTTPURLResponse else {
+      try? FileManager.default.removeItem(at: file)
+      throw PageLoadError.message("视频没有下载下来")
+    }
+    return (file, http)
+  }
+
+  private func setProgress(_ id: String, _ value: Double) {
+    guard !id.isEmpty else { return }
+    lock.lock()
+    progressMap[id] = min(max(value, 0), 0.99)
+    lock.unlock()
+  }
+
+  func urlSession(
+    _ session: URLSession,
+    downloadTask: URLSessionDownloadTask,
+    didWriteData bytesWritten: Int64,
+    totalBytesWritten: Int64,
+    totalBytesExpectedToWrite: Int64
+  ) {
+    let id = downloadTask.taskDescription ?? ""
+    let fraction: Double
+    if totalBytesExpectedToWrite > 0 {
+      fraction = Double(totalBytesWritten) / Double(totalBytesExpectedToWrite)
+    } else {
+      fraction = min(0.15 + Double(totalBytesWritten) / 8_000_000, 0.85)
+    }
+    setProgress(id, fraction)
+  }
+
+  func urlSession(_ session: URLSession, downloadTask: URLSessionDownloadTask, didFinishDownloadingTo location: URL) {
+    let ext = "part"
+    let dest = FileManager.default.temporaryDirectory.appendingPathComponent("saved-link-\(UUID().uuidString).\(ext)")
+    do {
+      if FileManager.default.fileExists(atPath: dest.path) {
+        try FileManager.default.removeItem(at: dest)
+      }
+      try FileManager.default.moveItem(at: location, to: dest)
+      lock.lock()
+      slots[downloadTask.taskIdentifier]?.file = dest
+      lock.unlock()
+    } catch {
+      lock.lock()
+      let slot = slots[downloadTask.taskIdentifier]
+      lock.unlock()
+      slot?.finish(.failure(PageLoadError.message("视频没有保存下来")))
+    }
+  }
+
+  func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
+    lock.lock()
+    let slot = slots.removeValue(forKey: task.taskIdentifier)
+    lock.unlock()
+    guard let slot else { return }
+    if let error {
+      if let file = slot.file {
+        try? FileManager.default.removeItem(at: file)
+      }
+      slot.finish(.failure(PageLoadError.message("视频没有下载下来")))
+      return
+    }
+    guard let http = task.response as? HTTPURLResponse, (200...299).contains(http.statusCode), let file = slot.file else {
+      if let file = slot.file {
+        try? FileManager.default.removeItem(at: file)
+      }
+      let code = (task.response as? HTTPURLResponse)?.statusCode ?? 0
+      slot.finish(.failure(PageLoadError.message(code == 0 ? "视频没有下载下来" : "下载失败 HTTP \(code)")))
+      return
+    }
+    slot.finish(.success(file))
   }
 }
 
@@ -343,6 +582,9 @@ private enum PageLoader {
       throw PageLoadError.message("没有连上解析站")
     }
     if let http = response as? HTTPURLResponse, !(200...299).contains(http.statusCode) {
+      if let text = String(data: data, encoding: .utf8), !text.isEmpty {
+        return text
+      }
       throw PageLoadError.message("解析站返回 HTTP \(http.statusCode)")
     }
     if data.count > 4_000_000 {
@@ -356,12 +598,12 @@ private enum PageLoader {
 
   private static let browserAgent = "Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Mobile/15E148 Safari/604.1"
 
-  static func download(url: String, referer: String) async throws -> String {
-    try await download(url: url, body: "", contentType: "", referer: referer, allowHtmlHop: true)
+  static func download(url: String, referer: String, jobId: String) async throws -> String {
+    try await download(url: url, body: "", contentType: "", referer: referer, allowHtmlHop: true, jobId: jobId)
   }
 
-  static func downloadPosted(url: String, body: String, contentType: String, referer: String) async throws -> String {
-    try await download(url: url, body: body, contentType: contentType, referer: referer, allowHtmlHop: true)
+  static func downloadPosted(url: String, body: String, contentType: String, referer: String, jobId: String) async throws -> String {
+    try await download(url: url, body: body, contentType: contentType, referer: referer, allowHtmlHop: true, jobId: jobId)
   }
 
   private static func download(
@@ -369,53 +611,54 @@ private enum PageLoader {
     body: String,
     contentType: String,
     referer: String,
-    allowHtmlHop: Bool
+    allowHtmlHop: Bool,
+    jobId: String
   ) async throws -> String {
-    guard let target = URL(string: url), let scheme = target.scheme?.lowercased(), scheme == "https" || scheme == "http" else {
+    guard let target = URL(string: url) else {
       throw PageLoadError.message("下载地址无效")
     }
-    var request = URLRequest(url: target)
-    request.timeoutInterval = 90
-    request.setValue(browserAgent, forHTTPHeaderField: "User-Agent")
-    request.setValue("*/*", forHTTPHeaderField: "Accept")
-    if !referer.isEmpty {
-      request.setValue(referer, forHTTPHeaderField: "Referer")
-    }
-    if !body.isEmpty {
-      request.httpMethod = "POST"
-      request.httpBody = Data(body.utf8)
-      request.setValue(contentType.isEmpty ? "application/x-www-form-urlencoded" : contentType, forHTTPHeaderField: "Content-Type")
-    }
-    let data: Data
-    let response: URLResponse
+    let fetched: (file: URL, response: HTTPURLResponse)
     do {
-      (data, response) = try await URLSession.shared.data(for: request)
+      fetched = try await DownloadHub.shared.fetch(
+        url: url,
+        body: body,
+        contentType: contentType,
+        referer: referer,
+        jobId: jobId
+      )
+    } catch let error as PageLoadError {
+      throw error
     } catch {
       throw PageLoadError.message("视频没有下载下来")
     }
-    if let http = response as? HTTPURLResponse, !(200...299).contains(http.statusCode) {
-      throw PageLoadError.message("下载失败 HTTP \(http.statusCode)")
-    }
-    let mime = (response.mimeType ?? "").lowercased()
+    let mime = (fetched.response.mimeType ?? "").lowercased()
     if allowHtmlHop, mime.contains("html") {
-      let sample = data.count > 300_000 ? data.subdata(in: 0..<300_000) : data
-      if let html = String(data: sample, encoding: .utf8), let next = firstMediaURL(in: html, base: target) {
-        return try await download(url: next, body: "", contentType: "", referer: referer, allowHtmlHop: false)
+      let piece = (try? FileHandle(forReadingFrom: fetched.file).read(upToCount: 300_000)) ?? Data()
+      try? FileManager.default.removeItem(at: fetched.file)
+      if let html = String(data: piece, encoding: .utf8), let next = firstMediaURL(in: html, base: target) {
+        return try await download(url: next, body: "", contentType: "", referer: referer, allowHtmlHop: false, jobId: jobId)
       }
       throw PageLoadError.message("解析站没有给出视频文件")
     }
-    if mime.contains("html") || data.count < 1024 {
+    let size = (try? FileManager.default.attributesOfItem(atPath: fetched.file.path)[.size] as? NSNumber)?.intValue ?? 0
+    if mime.contains("html") || size < 1024 {
+      try? FileManager.default.removeItem(at: fetched.file)
       throw PageLoadError.message("解析站没有给出视频文件")
     }
-    if data.count > 80_000_000 {
+    if size > 80_000_000 {
+      try? FileManager.default.removeItem(at: fetched.file)
       throw PageLoadError.message("这个视频太大，已停止保存")
     }
-    let ext = fileExtension(response: response, url: target)
+    let ext = fileExtension(response: fetched.response, url: target)
     let file = FileManager.default.temporaryDirectory
       .appendingPathComponent("saved-link-\(UUID().uuidString).\(ext)")
     do {
-      try data.write(to: file, options: .atomic)
+      if FileManager.default.fileExists(atPath: file.path) {
+        try FileManager.default.removeItem(at: file)
+      }
+      try FileManager.default.moveItem(at: fetched.file, to: file)
     } catch {
+      try? FileManager.default.removeItem(at: fetched.file)
       throw PageLoadError.message("视频没有保存下来")
     }
     return file.absoluteString
